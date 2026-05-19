@@ -1,0 +1,13 @@
+services:
+  ai-reviewer:
+    build: .
+    container_name: gitlab-ai-reviewer
+    ports:
+      - "8080:8080"
+    volumes:
+      # 호스트의 Claude 구독 credentials 마운트 (핵심).
+      # 권한 에러 발생 시 ":ro" 제거.
+      - ~/.claude:/root/.claude:ro
+    env_file:
+      - .env
+    restart: unless-stopped
