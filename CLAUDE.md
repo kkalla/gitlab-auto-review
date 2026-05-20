@@ -37,10 +37,13 @@ Two-file pipeline, intentionally split into separate processes:
 ```
 GitLab webhook → webhook_server.py (long-lived FastAPI)
                     └─ asyncio.create_subprocess_exec ──> review_runner.py (per-MR, one-shot)
-                                                              ├─ GET /merge_requests/:iid + /diffs
-                                                              ├─ claude -p "/review-pr\n..."
-                                                              └─ POST /merge_requests/:iid/notes
+                          ├─ GET /merge_requests/:iid, GET /projects/:id   (메타데이터)
+                          ├─ git clone --depth (임시 디렉토리) + target branch fetch
+                          ├─ claude -p "/review-pr\n..."  (클론에서 git diff 직접 실행)
+                          └─ POST /merge_requests/:iid/notes  (성공 리뷰 또는 ⚠️ 실패 알림)
 ```
+
+Review is **clone-based**: `review_runner.py` shallow-clones the repo into a temp dir and lets `claude` run `git diff` itself — it does **not** fetch diffs via the GitLab API.
 
 - **`webhook_server.py`** — webhook validation, filtering, dispatch only. Never blocks on review work; spawns `review_runner.py` as a subprocess so a crash there can't take the server down.
 - **`review_runner.py`** — does the actual API calls and Claude invocation. Designed to be invokable standalone for local testing.
@@ -72,17 +75,20 @@ Tool access is gated by a **static** `--allowed-tools` allowlist (`Read,Glob,Gre
 
 When `review_runner.py` fails (clone/fetch, `claude` non-zero or empty output, GitLab API errors), it posts a `⚠️ **AI 자동 코드 리뷰 실패**` comment to the MR with an `@REVIEWER_USERNAME` mention — the mention makes GitLab send its standard email, so the user learns of failures without watching container logs. The comment carries the failed stage, a heuristic cause, and the last `STDERR_TAIL_LINES` lines of `claude` stderr in a collapsed block. `ReviewError` carries `(stage, reason, detail)` from a failing stage up to `notify_failure()`. Notification is best-effort: if the comment POST itself fails (token/GitLab down) it is logged only — that overlap of "failure channel" and "failed thing" is an accepted blind spot. `claude` stderr is captured via `stderr=PIPE` (not inherited) and re-logged so docker logs still show it.
 
-### Token-budget guardrails
+### Clone / execution guardrails
 
-`review_runner.py` truncates aggressively before sending to Claude:
+`review_runner.py` works from a shallow clone (not API-fetched diffs). Key constants:
 
 | Constant | Value | Why |
 |---|---|---|
-| `MAX_FILES` | 10 | Cap files included in the prompt |
-| `MAX_DIFF_CHARS_PER_FILE` | 2000 | Cap per-file diff size |
-| `CLAUDE_TIMEOUT_SEC` | 120 | Hard kill on stalled CLI |
+| `CLONE_DEPTH` | 100 | shallow clone 깊이 — 일반적인 MR 분기 폭 커버 |
+| `DEEPEN_STEPS` | (300, 1000) | `merge-base` 미도달 시 점진적 `--deepen`, 최후엔 `--unshallow` |
+| `CLAUDE_TIMEOUT_SEC` | 600 | stalled CLI 강제 종료 |
+| `GIT_CLONE_TIMEOUT_SEC` / `GIT_FETCH_TIMEOUT_SEC` | 120 / 60 | git 작업 타임아웃 |
+| `STDERR_TAIL_LINES` / `MAX_DETAIL_CHARS` | 20 / 4000 | 실패 알림 코멘트 stderr 블록의 줄 수 / 문자 상한 |
+| `MAX_TITLE_CHARS` / `MAX_DESCRIPTION_CHARS` | 200 / 1000 | 프롬프트에 넣기 전 MR 메타데이터 절단 |
 
-If you change these, also update the "files omitted" footer message that depends on `len(diffs) > MAX_FILES`.
+`cloned_repo()` clones the source branch, fetches the target branch with an explicit refspec, and `_ensure_base_reachable()` deepens until `merge-base` resolves (or falls back to two-dot `..` diff on disjoint history). There is **no** `MAX_FILES` / `MAX_DIFF_CHARS_PER_FILE` truncation — that was the pre-clone, API-diff design and is gone.
 
 ## Required env vars
 
