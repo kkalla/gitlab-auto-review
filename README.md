@@ -5,7 +5,7 @@ GitLab 사내 인스턴스에서 본인이 리뷰어로 지정된 MR에 대해 C
 - Anthropic API 미사용 — 호스트의 Claude 구독 세션을 컨테이너에 마운트해서 사용
 - 실행 환경: Docker (FastAPI + Claude Code CLI)
 - 리뷰 트리거: GitLab webhook의 `Merge request events` 중 `action ∈ {open, update}` & `reviewers`에 지정 username 포함
-- `claude` 호출은 `--allowed-tools "Read"` 화이트리스트로 제한 — diff prompt injection으로 인한 RCE 표면 차단
+- `claude` 호출은 `--allowed-tools` 정적 화이트리스트(`Read,Glob,Grep,Bash(git:*)`)로 제한 — diff prompt injection으로 인한 RCE 표면 차단
 
 자세한 설계 배경은 [docs/gitlab-ai-reviewer.md](docs/gitlab-ai-reviewer.md), 구현 스펙은 [docs/bmad-output/implementation-artifacts/spec-gitlab-mr-auto-reviewer.md](docs/bmad-output/implementation-artifacts/spec-gitlab-mr-auto-reviewer.md) 참고.
 
@@ -54,7 +54,7 @@ docker compose logs -f ai-reviewer
 
 부팅 시 `WEBHOOK_SECRET` 길이/패턴, `GITLAB_URL` 스킴, 필수 env 누락 여부를 검증한다. 검증 실패 시 컨테이너가 즉시 종료되므로 로그에서 사유 확인.
 
-`~/.claude` 마운트에서 read-only 권한 에러가 발생하면 `docker-compose.yml`에서 `:ro` 플래그를 제거한다. `claude` 호출이 `--allowed-tools "Read"`로 제한되어 있어 컨테이너가 호스트 파일을 변조하지는 못한다.
+`~/.claude` 마운트는 rw로 둔다 — `claude`의 Bash 도구가 `~/.claude/shell-snapshots/`에 쓰고 OAuth 토큰 갱신도 쓰기가 필요해, `:ro`면 `EROFS`로 Bash 도구가 깨진다. `claude` 호출은 `--allowed-tools` 화이트리스트(읽기 도구 + git 하위명령)로 제한되어 git 외 임의 명령 실행은 차단된다.
 
 > **`sudo docker compose`로 실행하는 환경 주의**: base `docker-compose.yml`은 마운트 소스를 `~/.claude` 로 두는데, `sudo` 환경에서는 `~`이 `/root/.claude`로 확장되어 마운트가 빈 채로 컨테이너가 뜬다(→ `Not logged in` 에러). 이 경우 `docker-compose.override.yml.example`을 `docker-compose.override.yml`로 복사해 절대경로(예: `/home/max/.claude`)로 덮어쓴다. override는 `.gitignore`에 포함되어 커밋되지 않는다.
 

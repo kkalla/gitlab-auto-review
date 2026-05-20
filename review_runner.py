@@ -81,10 +81,12 @@ STDERR_TAIL_LINES = 20           # 실패 알림 코멘트에 포함할 claude s
 RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
 RETRY_ATTEMPTS = 2
 
-# claude `--permission-mode auto` 사용 — 내장 분류기가 read-only/local-scope는 자동 허용,
-# data exfil / git force push / self-modification 등은 자동 차단. 손으로 짠 화이트리스트보다
-# 정교. 분류기 룰은 `claude auto-mode defaults` 로 확인 가능.
-PERMISSION_MODE = "auto"
+# claude 도구 화이트리스트 — Read/Glob/Grep + 모든 git 하위명령.
+# `--permission-mode auto`는 Bash 호출마다 분류기 모델을 조회하는데, 그 모델이
+# "temporarily unavailable" 상태면 -p(비대화) 모드에서 물어볼 대상이 없어 무한
+# 대기하다 타임아웃난다. 정적 화이트리스트는 모델 의존이 없어 결정적이다.
+# git 외 Bash는 차단되므로 env 등으로 GITLAB_TOKEN을 노출하는 injection 경로도 막힌다.
+ALLOWED_TOOLS = "Read,Glob,Grep,Bash(git:*)"
 
 # git credential helper — PAT를 env var(GITLAB_TOKEN)로 전달 (ps 노출 회피)
 GIT_CREDENTIAL_HELPER = (
@@ -453,14 +455,14 @@ def run_claude_review(
     # stdout/stderr 모두 PIPE로 캡처 — stderr는 실패 알림 코멘트의 재료가 되고,
     # 캡처 후 logger로 재출력해 docker logs 가시성도 유지한다.
     logger.info(
-        "claude 호출 시작 (timeout=%ds, permission-mode=%s)",
-        CLAUDE_TIMEOUT_SEC, PERMISSION_MODE,
+        "claude 호출 시작 (timeout=%ds, allowed-tools=%s)",
+        CLAUDE_TIMEOUT_SEC, ALLOWED_TOOLS,
     )
     try:
         result = subprocess.run(
             [
                 "claude", "-p",
-                "--permission-mode", PERMISSION_MODE,
+                "--allowed-tools", ALLOWED_TOOLS,
                 "--add-dir", workdir,
             ],
             input=prompt,
