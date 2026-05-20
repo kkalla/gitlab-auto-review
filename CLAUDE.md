@@ -66,6 +66,10 @@ The container has **no Anthropic API key**. It runs `claude` by mounting the hos
 
 In `run_claude_review()`, the **first line of the prompt must be the slash command** (`/review-pr\n`) — Claude Code only treats it as a slash command in that position. Output is requested in Korean markdown to match the rest of the comment template (`🤖 **AI 자동 코드 리뷰**`).
 
+### Failure notification
+
+When `review_runner.py` fails (clone/fetch, `claude` non-zero or empty output, GitLab API errors), it posts a `⚠️ **AI 자동 코드 리뷰 실패**` comment to the MR with an `@REVIEWER_USERNAME` mention — the mention makes GitLab send its standard email, so the user learns of failures without watching container logs. The comment carries the failed stage, a heuristic cause, and the last `STDERR_TAIL_LINES` lines of `claude` stderr in a collapsed block. `ReviewError` carries `(stage, reason, detail)` from a failing stage up to `notify_failure()`. Notification is best-effort: if the comment POST itself fails (token/GitLab down) it is logged only — that overlap of "failure channel" and "failed thing" is an accepted blind spot. `claude` stderr is captured via `stderr=PIPE` (not inherited) and re-logged so docker logs still show it.
+
 ### Token-budget guardrails
 
 `review_runner.py` truncates aggressively before sending to Claude:
@@ -85,7 +89,7 @@ All consumed at import time (`os.environ[...]` — missing keys crash on boot, b
 - `GITLAB_URL` — base URL, no trailing slash (stripped defensively anyway).
 - `GITLAB_TOKEN` — PAT with `api` scope.
 - `WEBHOOK_SECRET` — must match GitLab webhook Secret Token.
-- `REVIEWER_USERNAME` (webhook_server only, default `max`) — the username whose presence in `reviewers` triggers a review.
+- `REVIEWER_USERNAME` (default `max`) — used by **both** processes: in `webhook_server.py` it gates which `reviewers[].username` triggers a review; in `review_runner.py` it is the `@`-mention target of the failure-notification comment.
 
 ## Conventions
 

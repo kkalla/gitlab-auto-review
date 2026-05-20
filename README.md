@@ -35,7 +35,7 @@ cp .env.example .env
 | `GITLAB_URL` | `https://gitlab.사내.도메인` | 끝 슬래시 X. `http(s)://`만 허용. embedded auth(`user:pass@`) 거부 |
 | `GITLAB_TOKEN` | `glpat-...` | `api` 스코프 PAT |
 | `WEBHOOK_SECRET` | 랜덤 16자 이상 | `change-me*`로 시작하면 부팅 거부 |
-| `REVIEWER_USERNAME` | `max` | GitLab username (생략 시 `max`) |
+| `REVIEWER_USERNAME` | `max` | 리뷰 트리거 대상 GitLab username + 리뷰 실패 시 알림 코멘트의 `@`멘션 대상 (생략 시 `max`) |
 
 `WEBHOOK_SECRET` 생성 한 줄:
 
@@ -105,6 +105,12 @@ curl -s -X POST http://localhost:8080/webhook/gitlab \
 ```
 
 `docker compose logs -f ai-reviewer` 로 백그라운드 태스크가 GitLab API 호출 → Claude 실행 → MR 노트 게시까지 진행되는지 확인.
+
+## 리뷰 실패 알림
+
+리뷰 도중 오류가 나면(clone/fetch 실패, `claude` 비정상 종료/빈 응답, GitLab API 오류) 해당 MR에 `⚠️ **AI 자동 코드 리뷰 실패**` 코멘트를 자동으로 단다. 코멘트 본문에 `@REVIEWER_USERNAME` 멘션이 들어가므로 **GitLab이 기본 메일 알림을 발송** — 컨테이너 로그를 보지 않아도 실패를 알 수 있다. 코멘트에는 실패 단계, 추정 원인, `claude` stderr 마지막 20줄(접은 블록)이 담긴다.
+
+> 한계: 코멘트 게시 자체가 실패하거나(토큰 만료·GitLab 다운) `webhook_server`가 죽으면 알림도 같이 불가능 — 이 사각지대는 설계상 허용된 손실이다.
 
 ## 트러블슈팅
 

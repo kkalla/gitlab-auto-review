@@ -33,6 +33,16 @@ logging.basicConfig(
 logger = logging.getLogger("review_runner")
 
 
+class ReviewError(Exception):
+    """리뷰 파이프라인 단계 실패. 사용자 알림 코멘트에 담을 정보를 운반한다."""
+
+    def __init__(self, stage: str, reason: str, detail: str = "") -> None:
+        self.stage = stage
+        self.reason = reason
+        self.detail = detail
+        super().__init__(f"[{stage}] {reason}")
+
+
 def _required_env(key: str) -> str:
     v = os.environ.get(key, "").strip()
     if not v:
@@ -52,6 +62,10 @@ GITLAB_URL = _GITLAB_URL_RAW
 
 PRIVATE_TOKEN = _required_env("GITLAB_TOKEN")
 
+# 리뷰 실패 시 알림 코멘트에서 @멘션할 대상.
+# webhook_server와 동일 컨테이너 env를 공유하므로 그대로 읽으면 된다.
+REVIEWER_USERNAME = os.environ.get("REVIEWER_USERNAME", "max").strip().lstrip("@") or "max"
+
 # 입력/실행 한도
 MAX_DESCRIPTION_CHARS = 1000
 MAX_TITLE_CHARS = 200
@@ -61,23 +75,16 @@ GIT_CLONE_TIMEOUT_SEC = 120
 GIT_FETCH_TIMEOUT_SEC = 60
 CLONE_DEPTH = 100                # 일반적인 MR 분기 폭 + shallow boundary 효과 여유
 DEEPEN_STEPS = (300, 1000)       # base 미도달 시 점진적으로 더 깊이 가져옴
+STDERR_TAIL_LINES = 20           # 실패 알림 코멘트에 포함할 claude stderr 마지막 줄 수
 
 # 백오프 재시도
 RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
 RETRY_ATTEMPTS = 2
 
-# Claude 권한 화이트리스트 — Read 외 git read-only 명령만 허용
-ALLOWED_TOOLS = ",".join([
-    "Read",
-    "Glob",
-    "Grep",
-    "Bash(git diff:*)",
-    "Bash(git log:*)",
-    "Bash(git show:*)",
-    "Bash(git status:*)",
-    "Bash(git rev-parse:*)",
-    "Bash(git branch:*)",
-])
+# claude `--permission-mode auto` 사용 — 내장 분류기가 read-only/local-scope는 자동 허용,
+# data exfil / git force push / self-modification 등은 자동 차단. 손으로 짠 화이트리스트보다
+# 정교. 분류기 룰은 `claude auto-mode defaults` 로 확인 가능.
+PERMISSION_MODE = "auto"
 
 # git credential helper — PAT를 env var(GITLAB_TOKEN)로 전달 (ps 노출 회피)
 GIT_CREDENTIAL_HELPER = (
@@ -89,6 +96,8 @@ REVIEW_HEADER = (
     "> 이 리뷰는 AI가 자동 생성한 결과입니다. MR 본문/diff 내용이 프롬프트에 포함되므로, "
     "외부에서 주입된 지시(prompt injection)가 결과에 섞여있을 가능성이 있어 검증이 필요합니다.\n\n"
 )
+
+FAILURE_HEADER = "⚠️ **AI 자동 코드 리뷰 실패**\n\n"
 
 
 def _safe_str(v: Any, fallback: str) -> str:
@@ -108,6 +117,36 @@ def _truncate(text: str, limit: int) -> str:
 def _escape_fence(text: str) -> str:
     """다중 backtick fence collision 방지."""
     return text.replace("```", "`​``")
+
+
+def _tail_lines(text: str, n: int) -> str:
+    """text의 마지막 n줄만 반환. 더 길면 앞부분 생략 표시를 붙인다."""
+    lines = text.rstrip().splitlines()
+    if len(lines) <= n:
+        return "\n".join(lines)
+    return "…(앞부분 생략)\n" + "\n".join(lines[-n:])
+
+
+def build_failure_comment(stage: str, reason: str, detail: str) -> str:
+    """리뷰 실패를 알리는 MR 코멘트 본문 생성.
+
+    @멘션을 본문에 넣어 GitLab 메일 알림을 트리거한다. detail(보통 claude stderr)은
+    접은 코드블록으로 마지막 STDERR_TAIL_LINES 줄만 담는다.
+    """
+    parts = [
+        FAILURE_HEADER,
+        f"@{REVIEWER_USERNAME} 자동 코드 리뷰 도중 오류가 발생해 리뷰를 완료하지 못했습니다.\n\n",
+        f"- **실패 단계:** {stage}\n",
+        f"- **추정 원인:** {reason}\n",
+    ]
+    detail = (detail or "").strip()
+    if detail:
+        tail = _tail_lines(detail, STDERR_TAIL_LINES)
+        parts.append(
+            f"\n<details>\n<summary>오류 로그 (마지막 {STDERR_TAIL_LINES}줄)</summary>\n\n"
+            f"```\n{_escape_fence(tail)}\n```\n\n</details>\n"
+        )
+    return "".join(parts)
 
 
 def _http_get_json(client: httpx.Client, url: str, *, headers: dict) -> Any:
@@ -417,47 +456,94 @@ def run_claude_review(
         "</untrusted-description>\n"
     )
 
-    # stderr는 부모로 상속 — claude 진행 메시지/권한 거부/세션 에러를 실시간으로 볼 수 있음.
-    # stdout만 PIPE로 capture (MR 노트로 게시할 결과물).
-    logger.info("claude 호출 시작 (timeout=%ds, allowed-tools=%s)", CLAUDE_TIMEOUT_SEC, ALLOWED_TOOLS)
+    # stdout/stderr 모두 PIPE로 캡처 — stderr는 실패 알림 코멘트의 재료가 되고,
+    # 캡처 후 logger로 재출력해 docker logs 가시성도 유지한다.
+    logger.info(
+        "claude 호출 시작 (timeout=%ds, permission-mode=%s)",
+        CLAUDE_TIMEOUT_SEC, PERMISSION_MODE,
+    )
     try:
         result = subprocess.run(
             [
                 "claude", "-p",
-                "--allowed-tools", ALLOWED_TOOLS,
+                "--permission-mode", PERMISSION_MODE,
                 "--add-dir", workdir,
             ],
             input=prompt,
             stdout=subprocess.PIPE,
-            # stderr 명시 안 함 = 부모로 상속
+            stderr=subprocess.PIPE,
             text=True,
             timeout=CLAUDE_TIMEOUT_SEC,
             cwd=workdir,
         )
     except FileNotFoundError as e:
-        raise RuntimeError("claude CLI를 PATH에서 찾을 수 없음 (컨테이너 빌드 확인)") from e
+        raise ReviewError(
+            "claude 실행",
+            "claude CLI를 PATH에서 찾을 수 없음 — 컨테이너 빌드를 확인하세요.",
+            str(e),
+        ) from e
     except subprocess.TimeoutExpired as e:
-        raise RuntimeError(f"Claude 실행 타임아웃 ({CLAUDE_TIMEOUT_SEC}s)") from e
+        partial = e.stderr if isinstance(e.stderr, str) else ""
+        if partial.strip():
+            logger.warning("claude stderr (timeout):\n%s", partial.strip())
+        raise ReviewError(
+            "claude 실행",
+            f"claude 실행 타임아웃 ({CLAUDE_TIMEOUT_SEC}s) — 레포/diff 과대 또는 호스트 응답 지연.",
+            partial,
+        ) from e
+
+    stderr_text = (result.stderr or "").strip()
+    if stderr_text:
+        # PIPE로 캡처했으므로 직접 재출력 — docker logs에서 계속 보이게 한다.
+        logger.warning("claude stderr:\n%s", stderr_text)
 
     if result.returncode != 0:
-        raise RuntimeError(f"Claude 실행 실패 (rc={result.returncode}) — 위쪽 stderr 로그 참고")
+        raise ReviewError(
+            "claude 실행",
+            "호스트 `claude` 세션 만료 가능성 — 호스트에서 `claude login` 재실행 후 다시 시도하세요.",
+            stderr_text or f"(stderr 없음, rc={result.returncode})",
+        )
 
     output = (result.stdout or "").strip()
     if not output:
-        raise RuntimeError("Claude 응답이 비어있음 — 호스트 세션 만료 가능성 (`claude login` 재실행)")
+        raise ReviewError(
+            "claude 실행",
+            "claude 응답이 비어 있음 — 호스트 세션 만료 또는 타임아웃 가능성.",
+            stderr_text or "(stderr 없음)",
+        )
     return output
 
 
-def post_comment(project_id: int, mr_iid: int, review: str) -> None:
-    safe_review = _truncate(review, MAX_REVIEW_BODY_CHARS - len(REVIEW_HEADER) - 100)
-    body = REVIEW_HEADER + safe_review
+def _post_note(project_id: int, mr_iid: int, body: str) -> None:
+    """MR에 노트(코멘트) 게시. body는 호출자가 완성한 최종 본문."""
+    safe_body = _truncate(body, MAX_REVIEW_BODY_CHARS - 100)
     with httpx.Client(timeout=30.0) as client:
         _http_post_json(
             client,
             f"{GITLAB_URL}/api/v4/projects/{project_id}/merge_requests/{mr_iid}/notes",
             headers={"PRIVATE-TOKEN": PRIVATE_TOKEN},
-            json={"body": body},
+            json={"body": safe_body},
         )
+
+
+def post_comment(project_id: int, mr_iid: int, review: str) -> None:
+    _post_note(project_id, mr_iid, REVIEW_HEADER + review)
+
+
+def notify_failure(
+    project_id: int, mr_iid: int, stage: str, reason: str, detail: str = ""
+) -> None:
+    """리뷰 실패를 MR 코멘트로 알린다 (best-effort).
+
+    @멘션 코멘트로 GitLab 메일 알림을 트리거한다. 게시 자체가 실패하면(토큰 만료,
+    GitLab 다운 등) 로그만 남긴다 — 알림 수단과 실패 수단이 겹치는 사각지대로,
+    설계상 허용된 손실이다.
+    """
+    try:
+        _post_note(project_id, mr_iid, build_failure_comment(stage, reason, detail))
+        logger.info("실패 알림 코멘트 게시 완료 (stage=%s)", stage)
+    except Exception:
+        logger.exception("실패 알림 코멘트 게시 불가 — 로그만 남김 (stage=%s)", stage)
 
 
 def main(project_id: int, mr_iid: int) -> int:
@@ -465,11 +551,16 @@ def main(project_id: int, mr_iid: int) -> int:
 
     try:
         mr = get_mr_metadata(project_id, mr_iid)
-    except Exception:
+    except Exception as e:
         logger.exception("MR 메타데이터 조회 실패 (project=%s mr=%s)", project_id, mr_iid)
+        notify_failure(
+            project_id, mr_iid, "MR 메타데이터 조회",
+            "GitLab API 응답 오류 — 토큰 권한 또는 MR 접근 가능 여부를 확인하세요.",
+            str(e),
+        )
         return 1
 
-    # Fork MR 차단 — 초기 스코프 외
+    # Fork MR 차단 — 초기 스코프 외 (실패가 아니므로 알림 없음)
     src_pid = mr.get("source_project_id")
     tgt_pid = mr.get("target_project_id")
     if src_pid != tgt_pid:
@@ -482,6 +573,10 @@ def main(project_id: int, mr_iid: int) -> int:
     target_branch = _safe_str(mr.get("target_branch"), "")
     if not source_branch or not target_branch:
         logger.error("source/target branch 누락 (project=%s mr=%s)", project_id, mr_iid)
+        notify_failure(
+            project_id, mr_iid, "MR 메타데이터 조회",
+            "MR 응답에 source/target branch가 없음 — MR 상태를 확인하세요.",
+        )
         return 1
 
     title = _truncate(_safe_str(mr.get("title"), "(제목 없음)"), MAX_TITLE_CHARS)
@@ -490,8 +585,13 @@ def main(project_id: int, mr_iid: int) -> int:
 
     try:
         project_path = get_project_path(project_id)
-    except Exception:
+    except Exception as e:
         logger.exception("project path 조회 실패 (project=%s)", project_id)
+        notify_failure(
+            project_id, mr_iid, "프로젝트 경로 조회",
+            "GitLab API 응답 오류 — 토큰 권한을 확인하세요.",
+            str(e),
+        )
         return 1
 
     try:
@@ -505,21 +605,39 @@ def main(project_id: int, mr_iid: int) -> int:
                     target_branch=target_branch,
                     base_reachable=base_reachable,
                 )
-            except Exception:
+            except ReviewError as e:
+                logger.error(
+                    "Claude 리뷰 생성 실패 (project=%s mr=%s): %s",
+                    project_id, mr_iid, e,
+                )
+                notify_failure(project_id, mr_iid, e.stage, e.reason, e.detail)
+                return 1
+            except Exception as e:
                 logger.exception(
                     "Claude 리뷰 생성 실패 (project=%s mr=%s)", project_id, mr_iid
+                )
+                notify_failure(
+                    project_id, mr_iid, "claude 실행",
+                    "예기치 못한 오류로 리뷰 생성에 실패했습니다.",
+                    str(e),
                 )
                 return 1
             try:
                 post_comment(project_id, mr_iid, review)
             except Exception:
+                # 알림 수단(MR 코멘트)과 실패 수단이 동일 — 별도 알림 불가, 로그만.
                 logger.exception(
                     "MR 노트 게시 실패 (project=%s mr=%s)", project_id, mr_iid
                 )
                 return 1
-    except Exception:
+    except Exception as e:
         logger.exception(
             "repo clone/fetch 실패 (project=%s mr=%s)", project_id, mr_iid
+        )
+        notify_failure(
+            project_id, mr_iid, "저장소 clone/fetch",
+            "GITLAB_TOKEN 권한/만료 또는 네트워크 문제 가능성.",
+            str(e),
         )
         return 1
 
