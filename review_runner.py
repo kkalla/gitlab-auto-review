@@ -474,6 +474,17 @@ def run_claude_review(
         "</untrusted-description>\n"
     )
 
+    # claude 서브프로세스에서 자격증명 env를 제거한다.
+    # clone/fetch는 이 함수 호출 전에 이미 끝났고, claude는 클론된 로컬 레포에서
+    # git diff/log/show만 돌리므로 GITLAB_TOKEN·WEBHOOK_SECRET이 전혀 필요 없다.
+    # `Bash(git:*)` 화이트리스트는 임의 명령 실행을 완전히 막지 못한다 —
+    # `git -c core.pager=!cmd`, `diff.external`, `!`-alias 등이 모두 `git ` 접두사라
+    # 매칭된다. prompt injection이 성공해도 토큰 자체가 env에 없으면 유출 불가.
+    claude_env = {
+        k: v for k, v in os.environ.items()
+        if k not in {"GITLAB_TOKEN", "WEBHOOK_SECRET"}
+    }
+
     # stdout/stderr 모두 PIPE로 캡처 — stderr는 실패 알림 코멘트의 재료가 되고,
     # 캡처 후 logger로 재출력해 docker logs 가시성도 유지한다.
     logger.info(
@@ -493,6 +504,7 @@ def run_claude_review(
             text=True,
             timeout=CLAUDE_TIMEOUT_SEC,
             cwd=workdir,
+            env=claude_env,
         )
     except FileNotFoundError as e:
         raise ReviewError(

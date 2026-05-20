@@ -69,7 +69,9 @@ The container has **no Anthropic API key**. It runs `claude` by mounting the hos
 
 In `run_claude_review()`, the **first line of the prompt must be the slash command** (`/review-pr\n`) — Claude Code only treats it as a slash command in that position. Output is requested in Korean markdown. The CLI's output is posted to the MR **verbatim** — `post_comment()` prepends no header (the `/review-pr` output already carries its own heading). Failures instead post the `⚠️` header — see Failure notification.
 
-Tool access is gated by a **static** `--allowed-tools` allowlist (`Read,Glob,Grep,Bash(git:*)`), deliberately **not** `--permission-mode auto`: auto mode consults a classifier model on every Bash call, and when that model is "temporarily unavailable" the unattended `-p` run has no one to fall back to — it stalls for the entire `CLAUDE_TIMEOUT_SEC` and is killed. The static allowlist has no model dependency and denies non-git Bash, which also blocks `env`-style `GITLAB_TOKEN` exfiltration via prompt injection. Don't switch this back to `auto`.
+Tool access is gated by a **static** `--allowed-tools` allowlist (`Read,Glob,Grep,Bash(git:*)`), deliberately **not** `--permission-mode auto`: auto mode consults a classifier model on every Bash call, and when that model is "temporarily unavailable" the unattended `-p` run has no one to fall back to — it stalls for the entire `CLAUDE_TIMEOUT_SEC` and is killed. The static allowlist has no model dependency. Don't switch this back to `auto`.
+
+`Bash(git:*)` does **not** by itself prevent arbitrary command execution — `git -c core.pager=…`, `git -c diff.external=…`, and `!`-aliases all run a shell and all match the `git ` prefix. So the allowlist is a surface-reducer, not an RCE seal. The actual defense against credential theft is **env isolation**: `run_claude_review()` builds a `claude_env` that strips `GITLAB_TOKEN` and `WEBHOOK_SECRET` and passes it as `env=`. `claude` only runs local git (`diff`/`log`/`show`) on the already-cloned repo — clone/fetch finished before it starts — so it needs neither secret. Never pass the full process environment to the `claude` subprocess.
 
 ### Failure notification
 

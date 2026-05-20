@@ -5,7 +5,7 @@ GitLab 사내 인스턴스에서 본인이 리뷰어로 지정된 MR에 대해 C
 - Anthropic API 미사용 — 호스트의 Claude 구독 세션을 컨테이너에 마운트해서 사용
 - 실행 환경: Docker (FastAPI + Claude Code CLI)
 - 리뷰 트리거: GitLab webhook의 `Merge request events` 중 `action ∈ {open, update}` & `reviewers`에 지정 username 포함
-- `claude` 호출은 `--allowed-tools` 정적 화이트리스트(`Read,Glob,Grep,Bash(git:*)`)로 제한 — diff prompt injection으로 인한 RCE 표면 차단
+- `claude` 호출은 `--allowed-tools` 정적 화이트리스트(`Read,Glob,Grep,Bash(git:*)`)로 표면을 줄이고, `GITLAB_TOKEN`·`WEBHOOK_SECRET`을 claude 서브프로세스 env에서 제거 — diff prompt injection이 성공해도 토큰이 env에 없어 유출 불가
 
 자세한 설계 배경은 [docs/gitlab-ai-reviewer.md](docs/gitlab-ai-reviewer.md), 구현 스펙은 [docs/bmad-output/implementation-artifacts/spec-gitlab-mr-auto-reviewer.md](docs/bmad-output/implementation-artifacts/spec-gitlab-mr-auto-reviewer.md) 참고.
 
