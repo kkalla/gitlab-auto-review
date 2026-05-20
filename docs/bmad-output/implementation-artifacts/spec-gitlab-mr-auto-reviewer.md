@@ -2,7 +2,7 @@
 title: 'GitLab MR 자동 리뷰 서비스 초기 구현'
 type: 'feature'
 created: '2026-05-19'
-status: 'in-progress'
+status: 'done'
 baseline_commit: '905f87840bf8594e79f38378badf98601fb57787'
 context:
   - '{project-root}/docs/gitlab-ai-reviewer.md'
@@ -114,3 +114,70 @@ context:
 **Manual checks (if no CLI):**
 - `docker compose logs ai-reviewer` 에서 webhook 수신/필터링 로그가 보이는지.
 - 호스트에서 `claude` 로그인된 상태에서 컨테이너 안 `claude --version`이 동작하는지(`docker compose exec ai-reviewer claude --version`).
+
+### Review Findings
+
+_Code review by `bmad-code-review` on 2026-05-20. Diff: `905f878..0a34f53`. Layers: Blind Hunter + Edge Case Hunter + Acceptance Auditor._
+
+#### Decision needed (3 — all resolved)
+
+- [x] [Review][Decision→Patch] **CRITICAL** `--dangerously-skip-permissions` 제거 + `--allowed-tools "Read"` 화이트리스트로 변경 → diff prompt injection RCE 경로 차단 (resolved: option 1 — Read만 허용으로 좁힘)
+- [x] [Review][Decision→Patch] **HIGH** 동일 MR 동시 webhook 중복 처리 → in-flight set 도입, 진행 중인 `(project_id, mr_iid)`는 200 + `skipped` 응답 (resolved: option 1)
+- [x] [Review][Decision→Defer] **MEDIUM** `~/.claude` 마운트 권한 정책 — deferred. 사유: Decision #1로 RCE 표면 충분히 좁혀짐, 운영 후 재검토.
+
+#### Patch (28 — all applied)
+
+**CRITICAL**
+
+- [x] [Review][Patch] Webhook 토큰 비교를 `hmac.compare_digest`로 변경 (타이밍 공격 방어) [`webhook_server.py:40`]
+- [x] [Review][Patch] (from Decision #1) `claude` argv에서 `--dangerously-skip-permissions` 제거하고 `--allowed-tools "Read"` 사용 — diff prompt injection으로 인한 컨테이너 RCE 차단 [`review_runner.py:83`]
+
+**HIGH**
+
+- [x] [Review][Patch] `subprocess.TimeoutExpired`를 `RuntimeError`로 명시 래핑 + `main()` 단계별 try/except 로 어느 단계 실패인지 식별 [`review_runner.py:82-91`, `:106-112`]
+- [x] [Review][Patch] `asyncio.create_task` 결과를 모듈 set에 보관 + `add_done_callback`으로 GC 사일런트 취소 방지 [`webhook_server.py:74`]
+- [x] [Review][Patch] (from Decision #2) in-flight set 도입 — `(project_id, mr_iid)` 키로 진행 중 리뷰 추적, 같은 MR 재진입은 200 + `{"status": "skipped", "reason": "review in progress"}` [`webhook_server.py:74`]
+- [x] [Review][Patch] `sys.executable` 사용 + `review_runner.py` 절대 경로로 호출, CWD/PATH 의존 제거 [`webhook_server.py:82-86`]
+- [x] [Review][Patch] webhook payload type 가드 — `object_attributes`/`reviewers`/`project_id`/`mr_iid`가 비dict/비list/비int 일 때 500 대신 200 + `skipped` [`webhook_server.py:46-74`]
+- [x] [Review][Patch] `diff_text` 안에 들어가는 title/description/diff 본문을 명시 구분자(`<diff>...</diff>`)로 감싸고 `/review-pr` 슬래시 명령 하이재킹/마크다운 스푸핑 방지 [`review_runner.py:65-72`]
+- [x] [Review][Patch] MR 노트 본문 길이 truncate + "AI 생성, 검증 필요" 면책 + diff 인용 영역 표시 [`review_runner.py:96`]
+- [x] [Review][Patch] GitLab API 응답 type 가드 — non-JSON, `diffs` non-list, diff entry non-dict 입력 방어 [`review_runner.py:35-56`]
+- [x] [Review][Patch] `claude` 실행 결과 `rc=0` + `stdout` 빈 경우 → 빈 노트 게시 방지 (RuntimeError) [`review_runner.py:82-91`]
+- [x] [Review][Patch] `FileNotFoundError`(claude 바이너리 누락) 명시 catch → 식별 가능한 RuntimeError로 변환 [`review_runner.py:82`]
+
+**MEDIUM**
+
+- [x] [Review][Patch] 부트 시 `WEBHOOK_SECRET` 길이/패턴 검증 — 빈 문자열·더미 값(`change-me-*`) 거부 [`webhook_server.py:23`, `review_runner.py:27-28`]
+- [x] [Review][Patch] 부트 시 `GITLAB_URL` 스킴/호스트 검증 — `http(s)` 외 거부, 임베디드 auth 거부 (PRIVATE_TOKEN 누출 방어) [`review_runner.py:30`]
+- [x] [Review][Patch] `.dockerignore` 추가 (`.env`, `.env.*`, `__pycache__/`, `.venv/`) — 이미지 시크릿 누출 이중 방어
+- [x] [Review][Patch] 401 응답 본문 제거 — spec "본문 없이 401만 반환" 일치 (`Response(status_code=401)` 사용) [`webhook_server.py:43`]
+- [x] [Review][Patch] `docs/gitlab-ai-reviewer.md`의 `kkalla` 예시 username을 `max`(또는 placeholder)로 정합화 — 컨텍스트 doc과 실제 동작 불일치
+- [x] [Review][Patch] description 길이 cap(예: 1000자) 적용 — 토큰 폭주 방지 [`review_runner.py:42-44`]
+- [x] [Review][Patch] truncate된 diff에 잔존 `` ``` `` fence 이스케이프 또는 별도 구분자 사용 — fence 조기 종료 방지 [`review_runner.py:54`]
+- [x] [Review][Patch] GitLab API 호출에 5xx/429 한정 지수 백오프 1-2회 재시도 [`review_runner.py:38-50`, `:88-94`]
+- [x] [Review][Patch] `Request.json()` 호출 실패 시 400으로 변환 + `Content-Length` 상한 검증 [`webhook_server.py:46`]
+- [x] [Review][Patch] `_run_review` 서브프로세스에 `asyncio.wait_for` 외곽 타임아웃 가드 (예: 180s) [`webhook_server.py:88`]
+- [x] [Review][Patch] 대용량 stdout/stderr 파이프 풀 블록 방지 — stdout DEVNULL 또는 사이즈 cap [`webhook_server.py:85-90`]
+- [x] [Review][Patch] `claude` 프롬프트가 ARG_MAX(약 128KB) 근처일 때 stdin으로 전달하도록 변경 [`review_runner.py:82-86`]
+
+**LOW**
+
+- [x] [Review][Patch] 빈 `diffs` 리스트(변경 없는 MR) 명시 처리 — Claude가 빈 내용에 환각 리뷰하지 않도록 [`review_runner.py:47-56`]
+- [x] [Review][Patch] `sys.argv` 양수/0 검증 — 부정/0 입력에 명시 에러 [`review_runner.py:115-120`]
+- [x] [Review][Patch] `result.stderr or ''` 방어 — None 가능성 가드 [`review_runner.py:90`]
+- [x] [Review][Patch] `RuntimeError` 메시지에서 `stderr` 직접 노출 제거 — debug 로그로만, 사용자 메시지에는 rc만 [`review_runner.py:88-91`]
+
+#### Deferred (2)
+
+- [x] [Review][Defer] **LOW** SIGTERM graceful shutdown 부재 [`webhook_server.py`] — deferred, 초기 구현 허용 범위 (spec의 `Ask First` "동시 MR 처리" 정책과 함께 운영 후 재검토)
+- [x] [Review][Defer] **MEDIUM** `~/.claude` 마운트 권한 정책 [`docker-compose.yml:10` + `README.md:34-36`] — deferred. 사유: Decision #1로 RCE 표면 충분히 좁혀짐, 운영 후 재검토.
+
+#### Dismissed (7)
+
+- description falsy 체크(`mr.get('description') or '없음'`)가 빈 문자열을 None과 동일 처리 — 동작 차이 미미
+- reviewers None entries 처리 후 빈 로그 모호함 — 이미 isinstance 필터로 안전
+- docker-compose `version:` 키 누락 — Compose v2에서는 deprecated
+- 골든 프롬프트에 "출력은 한국어 마크다운으로" 한 줄 추가 — spec 의도와 부합
+- context doc의 `COPY . .` vs 실제 `COPY webhook_server.py review_runner.py ./` — 구현이 더 안전
+- context doc의 `environment:` 인라인 vs 실제 `env_file:` — 구현이 더 안전
+- "스택 트레이스 stdout 기록" — `logging.basicConfig(stream=sys.stdout)`로 만족

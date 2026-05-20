@@ -1,0 +1,20 @@
+# 호스트별 override 설정.
+#
+# 이 파일을 `docker-compose.override.yml` 로 복사한 뒤 자기 환경에 맞게 수정한다.
+# docker compose는 base의 docker-compose.yml과 이 override 파일을 자동으로 병합한다.
+# (override.yml은 .gitignore에 포함 — 커밋되지 않음)
+#
+# 용도:
+# - `sudo docker compose` 로 실행하는 환경에서 base의 `~/.claude` 가 `/root/.claude`
+#   로 확장되어 마운트가 비는 문제를 해결.
+# - 호스트 사용자별로 다른 credentials 위치를 가리키기 위함.
+
+services:
+  ai-reviewer:
+    volumes:
+      # 호스트의 실제 ~/.claude 디렉토리 (credentials/settings/history 등).
+      # rw 필수 — claude의 Bash 도구가 shell-snapshots를 쓰고 OAuth 갱신도 쓰기가 필요.
+      # :ro면 EROFS로 Bash 도구가 깨진다.
+      - /home/max/.claude:/root/.claude
+      # claude CLI는 ~/.claude.json 단일 파일도 별도로 필요 (세션/설정). rw 유지.
+      - /home/max/.claude.json:/root/.claude.json
