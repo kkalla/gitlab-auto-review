@@ -58,13 +58,13 @@ Anything else returns `{"status": "skipped", "reason": "..."}` with 200. Don't t
 
 The container has **no Anthropic API key**. It runs `claude` by mounting the host's `~/.claude` into the container (`docker-compose.yml`), reusing the host user's Claude subscription session. Consequences worth remembering:
 
-- The `:ro` mount can fight OAuth token refresh — README documents removing `:ro` as the fix; preserve that path.
+- The host `~/.claude` is mounted **read-write**. Claude Code's Bash tool writes shell snapshots under `~/.claude/shell-snapshots/`, and OAuth token refresh also needs write access — a `:ro` mount breaks the Bash tool with `EROFS`. Don't re-add `:ro`.
 - If `claude -p` returns non-zero, the most common cause is host session expiry, not container state. Tell the user to re-run `claude login` on the **host**.
 - Don't add code paths that assume `ANTHROPIC_API_KEY`; that env var is intentionally absent.
 
 ### Claude invocation rules
 
-In `run_claude_review()`, the **first line of the prompt must be the slash command** (`/review-pr\n`) — Claude Code only treats it as a slash command in that position. Output is requested in Korean markdown to match the rest of the comment template (`🤖 **AI 자동 코드 리뷰**`).
+In `run_claude_review()`, the **first line of the prompt must be the slash command** (`/review-pr\n`) — Claude Code only treats it as a slash command in that position. Output is requested in Korean markdown. The CLI's output is posted to the MR **verbatim** — `post_comment()` prepends no header (the `/review-pr` output already carries its own heading). Failures instead post the `⚠️` header — see Failure notification.
 
 ### Failure notification
 

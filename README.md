@@ -118,7 +118,8 @@ curl -s -X POST http://localhost:8080/webhook/gitlab \
 |---|---|---|
 | 부팅 직후 즉시 종료 | `WEBHOOK_SECRET` 16자 미만 또는 `change-me*` 시작 | 랜덤 시크릿 재생성 후 `.env` 갱신 |
 | 부팅 직후 즉시 종료 + `GITLAB_URL` 에러 | http/https 아닌 스킴, 또는 `user:pass@` 포함 | URL을 `https://gitlab.예제.com` 형태로 정리 |
-| `~/.claude` 권한 에러 | read-only 마운트와 OAuth 토큰 갱신 충돌 | `docker-compose.yml`에서 `:ro` 제거 |
+| 리뷰 코멘트에 `Bash 도구 동작 안 함 (EROFS)` | `~/.claude`가 `:ro`로 마운트돼 claude Bash 도구가 shell-snapshot을 못 씀 | docker-compose에서 `:ro` 제거 (기본값이 rw) 후 컨테이너 재생성 |
+| `~/.claude` 권한 에러 / OAuth 갱신 실패 | read-only 마운트 | docker-compose에서 `:ro` 제거 |
 | 401 응답만 반복 | 헤더/시크릿 불일치 | GitLab Webhook 설정의 Secret Token과 `.env`의 `WEBHOOK_SECRET` 일치 확인 |
 | `review in progress` 응답 반복 | 같은 MR로 webhook 빨리 두 번 옴 (의도된 차단) | 첫 리뷰 끝나면 in-flight set이 자동 해제됨 |
 | `Claude 응답이 비어있음` 로그 | 호스트 세션 만료 | 호스트에서 `claude login` 재실행 (컨테이너 재시작 불필요) |

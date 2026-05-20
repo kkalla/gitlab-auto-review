@@ -91,12 +91,6 @@ GIT_CREDENTIAL_HELPER = (
     '!f() { echo "username=oauth2"; echo "password=$GITLAB_TOKEN"; }; f'
 )
 
-REVIEW_HEADER = (
-    "🤖 **AI 자동 코드 리뷰**\n\n"
-    "> 이 리뷰는 AI가 자동 생성한 결과입니다. MR 본문/diff 내용이 프롬프트에 포함되므로, "
-    "외부에서 주입된 지시(prompt injection)가 결과에 섞여있을 가능성이 있어 검증이 필요합니다.\n\n"
-)
-
 FAILURE_HEADER = "⚠️ **AI 자동 코드 리뷰 실패**\n\n"
 
 
@@ -527,7 +521,7 @@ def _post_note(project_id: int, mr_iid: int, body: str) -> None:
 
 
 def post_comment(project_id: int, mr_iid: int, review: str) -> None:
-    _post_note(project_id, mr_iid, REVIEW_HEADER + review)
+    _post_note(project_id, mr_iid, review)
 
 
 def notify_failure(
