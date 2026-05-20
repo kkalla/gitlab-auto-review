@@ -18,7 +18,7 @@ GitLab 사내 인스턴스에서 **내가 리뷰어로 지정되면 자동으로
 ## 아키텍처
 
 ```
-GitLab MR (리뷰어: kkalla 지정)
+GitLab MR (리뷰어: max 지정)
     → Webhook POST 이벤트
     → FastAPI 웹훅 서버 (Docker)
     → review_runner.py 실행
@@ -215,7 +215,7 @@ curl -X POST http://localhost:8080/webhook/gitlab \
   -d '{
     "object_attributes": {"action": "update", "iid": 1},
     "project": {"id": 10},
-    "reviewers": [{"username": "kkalla"}]
+    "reviewers": [{"username": "max"}]
   }'
 ```
 

@@ -26,3 +26,6 @@ Thumbs.db
 
 # Logs
 *.log
+
+# 호스트별 Docker override (예시는 .example로 커밋)
+docker-compose.override.yml
