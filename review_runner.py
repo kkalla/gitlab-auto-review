@@ -169,7 +169,7 @@ def build_failure_comment(stage: str, reason: str, detail: str) -> str:
     return "".join(parts)
 
 
-def _http_get_json(client: httpx.Client, url: str, *, headers: dict) -> Any:
+def _http_get(client: httpx.Client, url: str, *, headers: dict) -> httpx.Response:
     delay = 1.0
     last_exc: Exception | None = None
     for attempt in range(RETRY_ATTEMPTS + 1):
@@ -185,18 +185,23 @@ def _http_get_json(client: httpx.Client, url: str, *, headers: dict) -> Any:
                 )
             else:
                 resp.raise_for_status()
-                try:
-                    return resp.json()
-                except ValueError as e:
-                    raise RuntimeError(
-                        f"GitLab 응답이 JSON이 아님 (status={resp.status_code})"
-                    ) from e
+                return resp
         if attempt < RETRY_ATTEMPTS:
             time.sleep(delay)
             delay *= 2
     if last_exc:
         raise RuntimeError("GitLab 호출 실패 (재시도 소진)") from last_exc
     raise RuntimeError("GitLab 호출 실패 (재시도 소진)")
+
+
+def _http_get_json(client: httpx.Client, url: str, *, headers: dict) -> Any:
+    resp = _http_get(client, url, headers=headers)
+    try:
+        return resp.json()
+    except ValueError as e:
+        raise RuntimeError(
+            f"GitLab 응답이 JSON이 아님 (status={resp.status_code})"
+        ) from e
 
 
 def _http_post_json(
@@ -257,11 +262,41 @@ def get_project_path(project_id: int) -> str:
     return path
 
 
+def get_token_username() -> str | None:
+    """현재 토큰 소유자의 username — AI 리뷰 식별 시 author 대조용 (M1).
+
+    조회 실패 시 None — 호출자는 author 검증 없이 마커만으로 fallback한다.
+    """
+    headers = {"PRIVATE-TOKEN": PRIVATE_TOKEN}
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            user = _http_get_json(client, f"{GITLAB_URL}/api/v4/user", headers=headers)
+    except Exception:
+        logger.exception("토큰 사용자 조회 실패 — AI 리뷰 author 검증 생략")
+        return None
+    if isinstance(user, dict):
+        uname = user.get("username")
+        if isinstance(uname, str) and uname:
+            return uname
+    return None
+
+
+def _parse_discussions_batch(data: Any) -> list[dict]:
+    if not isinstance(data, list):
+        raise RuntimeError(
+            f"GitLab discussions 응답이 list가 아님: {type(data).__name__}"
+        )
+    return [d for d in data if isinstance(d, dict)]
+
+
 def fetch_discussions(project_id: int, mr_iid: int) -> list[dict]:
-    """MR의 discussion(스레드) 목록을 페이지네이션하여 모두 가져온다.
+    """MR의 discussion(스레드) 목록을 페이지네이션하여 가져온다.
 
     discussions 엔드포인트는 코멘트를 스레드 단위로 묶어주며 각 노트의
-    resolved 상태와 diff 위치(position)도 함께 준다.
+    resolved 상태와 diff 위치(position)도 함께 준다. 응답은 created_at
+    오름차순이라 **최신** 리뷰는 마지막 페이지에 있다 — 페이지 수가
+    `MAX_DISCUSSION_PAGES`를 넘으면 첫 페이지가 아니라 마지막 cap개
+    페이지를 수집해야 최신 AI 리뷰를 놓치지 않는다 (M2).
     """
     headers = {"PRIVATE-TOKEN": PRIVATE_TOKEN}
     base = (
@@ -270,17 +305,32 @@ def fetch_discussions(project_id: int, mr_iid: int) -> list[dict]:
     )
     discussions: list[dict] = []
     with httpx.Client(timeout=30.0) as client:
-        for page in range(1, MAX_DISCUSSION_PAGES + 1):
-            batch = _http_get_json(
+        first = _http_get(client, f"{base}?per_page=100&page=1", headers=headers)
+        try:
+            total_pages = max(int(first.headers.get("X-Total-Pages") or "1"), 1)
+        except ValueError:
+            total_pages = 1
+
+        if total_pages > MAX_DISCUSSION_PAGES:
+            logger.warning(
+                "discussions %d페이지 — cap(%d) 초과, 최신 %d페이지만 수집",
+                total_pages, MAX_DISCUSSION_PAGES, MAX_DISCUSSION_PAGES,
+            )
+            start_page = total_pages - MAX_DISCUSSION_PAGES + 1
+        else:
+            start_page = 1
+
+        if start_page == 1:
+            discussions.extend(_parse_discussions_batch(first.json()))
+            loop_start = 2
+        else:
+            loop_start = start_page
+
+        for page in range(loop_start, total_pages + 1):
+            data = _http_get_json(
                 client, f"{base}?per_page=100&page={page}", headers=headers
             )
-            if not isinstance(batch, list):
-                raise RuntimeError(
-                    f"GitLab discussions 응답이 list가 아님: {type(batch).__name__}"
-                )
-            discussions.extend(d for d in batch if isinstance(d, dict))
-            if len(batch) < 100:
-                break
+            discussions.extend(_parse_discussions_batch(data))
     return discussions
 
 
@@ -289,24 +339,42 @@ def _is_failure_note(body: str) -> bool:
     return body.startswith("⚠️ **AI 자동 코드 리뷰 실패**")
 
 
-def _find_latest_ai_review(discussions: list[dict]) -> dict | None:
-    """마커를 보유한 노트(= 우리 서비스가 게시한 리뷰) 중 가장 최근 것을 반환."""
+def _note_author(note: dict) -> str:
+    """노트 작성자 username (없으면 빈 문자열)."""
+    a = note.get("author")
+    return _safe_str(a.get("username"), "") if isinstance(a, dict) else ""
+
+
+def _find_latest_ai_review(
+    discussions: list[dict], bot_username: str | None = None
+) -> dict | None:
+    """마커를 보유한 노트(= 우리 서비스 리뷰) 중 가장 최근 것을 반환.
+
+    bot_username이 주어지면 작성자가 그 계정인 노트만 후보로 삼는다 — 타 MR
+    참여자가 코멘트에 마커를 붙여넣어 AI 리뷰로 위장하는 스푸핑을 막는다 (M1).
+    None이면 마커 보유 여부만으로 판정(author 검증 생략).
+    """
     candidates: list[dict] = []
     for d in discussions:
         for note in d.get("notes", []):
             if not isinstance(note, dict):
                 continue
-            if REVIEW_MARKER_PREFIX in (note.get("body") or ""):
-                candidates.append(note)
+            if REVIEW_MARKER_PREFIX not in (note.get("body") or ""):
+                continue
+            if bot_username and _note_author(note) != bot_username:
+                continue
+            candidates.append(note)
     if not candidates:
         return None
     # note.id는 단조 증가하므로 최신 식별에 안전하다.
     return max(candidates, key=lambda n: n.get("id", 0))
 
 
-def extract_reviewed_sha(discussions: list[dict]) -> str | None:
+def extract_reviewed_sha(
+    discussions: list[dict], bot_username: str | None = None
+) -> str | None:
     """가장 최근 AI 리뷰 코멘트의 마커에서 증분 기준 SHA를 추출 (축 A·A1)."""
-    note = _find_latest_ai_review(discussions)
+    note = _find_latest_ai_review(discussions, bot_username)
     if not note:
         return None
     m = _MARKER_RE.search(note.get("body") or "")
@@ -340,15 +408,17 @@ def _note_locator(note: dict) -> str:
 
 
 def collect_prior_comments(
-    discussions: list[dict],
+    discussions: list[dict], bot_username: str | None = None
 ) -> tuple[str | None, list[dict]]:
     """미해결 코멘트를 분류해 (직전 AI 리뷰 본문, 사용자 코멘트 목록) 반환 (축 D).
 
     - system 노트·resolved 스레드·실패 알림은 제외.
-    - 마커 보유 최신 1개 = 직전 AI 리뷰 (D1a). 그 외 마커 노트(이전 회차 리뷰)는 버림.
+    - 마커 보유 최신 1개 = 직전 AI 리뷰 (D1a). 그 외 마커 노트(이전 회차 리뷰
+      또는 스푸핑 시도)는 버린다.
     - 나머지 비-system 노트 = 사용자 코멘트 (outdated 위치 포함, D2a).
+    - bot_username은 직전 AI 리뷰 식별 시 author 대조에 쓴다 (M1).
     """
-    latest_ai = _find_latest_ai_review(discussions)
+    latest_ai = _find_latest_ai_review(discussions, bot_username)
     latest_ai_id = latest_ai.get("id") if latest_ai else None
     prior_review = _strip_marker(latest_ai.get("body") or "") if latest_ai else None
 
@@ -367,15 +437,15 @@ def collect_prior_comments(
             if not body:
                 continue
             if REVIEW_MARKER_PREFIX in body:
-                continue  # 이전 회차 AI 리뷰 — D1a상 최신 1개만 사용
+                continue  # 이전 회차 AI 리뷰 또는 스푸핑 — 사용자 코멘트로 보지 않음
             if _is_failure_note(body):
                 continue
-            author = ""
-            a = note.get("author")
-            if isinstance(a, dict):
-                author = _safe_str(a.get("username"), "")
             user_comments.append(
-                {"author": author, "locator": _note_locator(note), "body": body}
+                {
+                    "author": _note_author(note),
+                    "locator": _note_locator(note),
+                    "body": body,
+                }
             )
     return prior_review, user_comments
 
@@ -633,6 +703,71 @@ def _git_head_sha(workdir: str) -> str:
     return proc.stdout.strip()
 
 
+def _count_new_commits(workdir: str, sha: str) -> int:
+    """`sha..HEAD` 사이 새 커밋 수. 판정 불가 시 -1 (호출자는 리뷰 진행, M3)."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", workdir, "rev-list", "--count", f"{sha}..HEAD"],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return -1
+    if proc.returncode != 0:
+        return -1
+    try:
+        return int(proc.stdout.strip())
+    except ValueError:
+        return -1
+
+
+def _build_diff_mode(
+    incremental_sha: str | None, base_reachable: bool, target_branch: str
+) -> tuple[str, str, str]:
+    """리뷰 모드별 (diff_hint, disjoint_note, scope_note) 안내 텍스트 생성.
+
+    - incremental_sha 있음: `incremental_sha..HEAD` 증분. 맥락 확인용 전체 diff는
+      base_reachable에 따라 3점/2점을 골라 disjoint에서도 깨지지 않게 한다 (L3).
+    - 없음 + base_reachable: merge-base 기준 `...` 전체 diff.
+    - 없음 + disjoint: `..` 2점 diff.
+    """
+    if incremental_sha:
+        full_diff = (
+            f"git diff origin/{target_branch}...HEAD"
+            if base_reachable
+            else f"git diff origin/{target_branch}..HEAD"
+        )
+        diff_hint = (
+            f"- `git diff {incremental_sha}..HEAD` — 직전 리뷰 이후 새 커밋의 변경 diff "
+            "(증분, **주 리뷰 대상**)\n"
+            f"- `git log {incremental_sha}..HEAD` — 직전 리뷰 이후 커밋 히스토리\n"
+            f"- `{full_diff}` — MR 전체 diff (필요시 맥락 확인용)\n"
+        )
+        scope_note = (
+            f"\n이번 리뷰는 **증분 리뷰**다. 커밋 `{incremental_sha[:12]}` 이후 새로 올라온 "
+            "변경만 리뷰 대상이며, 그 이전 변경은 이미 직전 리뷰에서 다뤘다. 증분 diff를 "
+            "중심으로 리뷰하되, 필요하면 전체 diff로 맥락만 확인해라.\n"
+        )
+        return diff_hint, "", scope_note
+
+    if base_reachable:
+        diff_hint = (
+            f"- `git diff origin/{target_branch}...HEAD` — 전체 변경 diff (merge-base 기준)\n"
+            f"- `git log origin/{target_branch}..HEAD` — 커밋 히스토리\n"
+        )
+        return diff_hint, "", ""
+
+    diff_hint = (
+        f"- `git diff origin/{target_branch}..HEAD` — 두 브랜치 단순 비교 diff "
+        "(공통 조상 없음 — 3점 `...` 사용 금지)\n"
+        f"- `git log HEAD --not origin/{target_branch}` — source에만 있는 커밋\n"
+    )
+    disjoint_note = (
+        "\n주의: 두 브랜치는 공통 조상이 없는 disjoint history다(force-push 또는 "
+        "별도 root). 3점 diff(`...`)는 실패하므로 위 명령을 사용해.\n"
+    )
+    return diff_hint, disjoint_note, ""
+
+
 def run_claude_review(
     workdir: str,
     *,
@@ -644,13 +779,16 @@ def run_claude_review(
     reviewed_sha: str | None = None,
     prior_review: str | None = None,
     user_comments: list[dict] | None = None,
-) -> str:
+) -> str | None:
     """클론된 디렉토리에서 Claude 슬래시 커맨드 실행.
 
     reviewed_sha가 주어지고 클론에 도달 가능하면 `reviewed_sha..HEAD` 증분 리뷰 모드.
     그 외에는 base_reachable에 따라 전체 diff(merge-base `...` 또는 disjoint `..`).
     prior_review·user_comments는 직전 리뷰·미해결 코멘트로, prompt injection 면역
     블록으로 직렬화해 프롬프트에 주입한다.
+
+    증분 모드인데 새 커밋이 없으면(메타데이터-only update 등) None을 반환 —
+    호출자는 게시 없이 스킵한다 (M3).
     """
     incremental_sha: str | None = None
     if reviewed_sha:
@@ -661,37 +799,16 @@ def run_claude_review(
                 "reviewed_sha %s가 클론에 없음 — 전체 diff로 fallback", reviewed_sha
             )
 
-    if incremental_sha:
-        diff_hint = (
-            f"- `git diff {incremental_sha}..HEAD` — 직전 리뷰 이후 새 커밋의 변경 diff "
-            "(증분, **주 리뷰 대상**)\n"
-            f"- `git log {incremental_sha}..HEAD` — 직전 리뷰 이후 커밋 히스토리\n"
-            f"- `git diff origin/{target_branch}...HEAD` — MR 전체 diff (필요시 맥락 확인용)\n"
+    if incremental_sha and _count_new_commits(workdir, incremental_sha) == 0:
+        logger.info(
+            "증분 기준 %s 이후 새 커밋 없음 — 리뷰 스킵 (메타데이터-only update)",
+            incremental_sha[:12],
         )
-        disjoint_note = ""
-        scope_note = (
-            f"\n이번 리뷰는 **증분 리뷰**다. 커밋 `{incremental_sha[:12]}` 이후 새로 올라온 "
-            "변경만 리뷰 대상이며, 그 이전 변경은 이미 직전 리뷰에서 다뤘다. 증분 diff를 "
-            "중심으로 리뷰하되, 필요하면 전체 diff로 맥락만 확인해라.\n"
-        )
-    elif base_reachable:
-        diff_hint = (
-            f"- `git diff origin/{target_branch}...HEAD` — 전체 변경 diff (merge-base 기준)\n"
-            f"- `git log origin/{target_branch}..HEAD` — 커밋 히스토리\n"
-        )
-        disjoint_note = ""
-        scope_note = ""
-    else:
-        diff_hint = (
-            f"- `git diff origin/{target_branch}..HEAD` — 두 브랜치 단순 비교 diff "
-            "(공통 조상 없음 — 3점 `...` 사용 금지)\n"
-            f"- `git log HEAD --not origin/{target_branch}` — source에만 있는 커밋\n"
-        )
-        disjoint_note = (
-            "\n주의: 두 브랜치는 공통 조상이 없는 disjoint history다(force-push 또는 "
-            "별도 root). 3점 diff(`...`)는 실패하므로 위 명령을 사용해.\n"
-        )
-        scope_note = ""
+        return None
+
+    diff_hint, disjoint_note, scope_note = _build_diff_mode(
+        incremental_sha, base_reachable, target_branch
+    )
 
     # 블록 구분 태그에 무작위 nonce를 붙여 untrusted 블록 조기 종료(주입 탈출)를 막는다.
     nonce = secrets.token_hex(4)
@@ -811,10 +928,15 @@ def build_review_comment(review: str, head_sha: str) -> str:
     """리뷰 본문 끝에 증분 기준 SHA 마커를 심는다 (다음 회차가 회수, 축 A·A1).
 
     head_sha가 비면 마커 없이 게시 — 다음 회차는 증분 불가(전체 diff fallback).
+    본문을 먼저 절단해 마커 자리를 확보한다 — _post_note의 절단이 끝에 붙은
+    마커를 잘라 다음 회차 증분을 깨뜨리지 않게 한다 (L1). 50은 _truncate
+    절단 안내 문구("…(잘림, N자 생략)") 길이 여유분.
     """
     if not head_sha:
         return review
-    return f"{review}\n\n{REVIEW_MARKER_PREFIX} {head_sha} -->"
+    marker = f"\n\n{REVIEW_MARKER_PREFIX} {head_sha} -->"
+    budget = MAX_REVIEW_BODY_CHARS - 100 - len(marker) - 50
+    return _truncate(review, budget) + marker
 
 
 def post_comment(
@@ -894,10 +1016,14 @@ def main(project_id: int, mr_iid: int, oldrev: str | None = None) -> int:
     except Exception:
         logger.exception("MR discussions 조회 실패 — 증분/코멘트 없이 전체 리뷰 진행")
 
-    reviewed_sha = extract_reviewed_sha(discussions) or _normalize_oldrev(oldrev)
-    prior_review, user_comments = collect_prior_comments(discussions)
+    bot_username = get_token_username()  # M1 — AI 리뷰 author 대조용
+    reviewed_sha = (
+        extract_reviewed_sha(discussions, bot_username) or _normalize_oldrev(oldrev)
+    )
+    prior_review, user_comments = collect_prior_comments(discussions, bot_username)
     logger.info(
-        "리뷰 컨텍스트: reviewed_sha=%s, 직전 AI 리뷰=%s, 미해결 사용자 코멘트=%d건",
+        "리뷰 컨텍스트: bot=%s, reviewed_sha=%s, 직전 AI 리뷰=%s, 미해결 사용자 코멘트=%d건",
+        bot_username or "(미상)",
         reviewed_sha or "(없음 — 전체 리뷰)",
         "있음" if prior_review else "없음",
         len(user_comments),
@@ -941,6 +1067,10 @@ def main(project_id: int, mr_iid: int, oldrev: str | None = None) -> int:
                     str(e),
                 )
                 return 1
+            if review is None:
+                # 증분 기준 이후 새 커밋 없음 (메타데이터-only update) — 게시 없이 종료
+                logger.info("MR !%s 리뷰 스킵 — 새 커밋 없음", mr_iid)
+                return 0
             try:
                 post_comment(project_id, mr_iid, review, head_sha)
             except Exception:

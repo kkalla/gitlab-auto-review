@@ -1,0 +1,4 @@
+# 개발/테스트 전용 의존성. 런타임 Docker 이미지에는 포함되지 않는다
+# (Dockerfile은 requirements.txt만 COPY/install).
+-r requirements.txt
+pytest==8.3.3

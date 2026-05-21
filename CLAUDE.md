@@ -18,7 +18,11 @@ pip install -r requirements.txt
 uvicorn webhook_server:app --reload --port 8080
 
 # Trigger review_runner directly (bypasses webhook gate)
-python review_runner.py <project_id> <mr_iid>
+python review_runner.py <project_id> <mr_iid> [oldrev]
+
+# Unit tests (pure functions in review_runner.py)
+pip install -r requirements-dev.txt
+pytest -q
 
 # Smoke tests against a running server
 curl -s http://localhost:8080/healthz
@@ -28,7 +32,7 @@ curl -X POST http://localhost:8080/webhook/gitlab \
   -d '{"object_attributes":{"action":"open","iid":1},"project":{"id":10},"reviewers":[{"username":"max"}]}'
 ```
 
-There is no test suite yet (`requirements.txt` has no pytest).
+Tests cover only `review_runner.py`'s pure functions (marker parsing, comment filtering, injection defense) in `tests/test_review_runner.py`. Test-only deps live in `requirements-dev.txt` — the runtime `requirements.txt` (and the Docker image) deliberately exclude `pytest`. `tests/conftest.py` fills dummy env vars so the module can be imported.
 
 ## Architecture
 
@@ -64,11 +68,12 @@ Anything else returns `{"status": "skipped", "reason": "..."}` with 200. Don't t
 
 A webhook `update` fires on every push to the MR, so a re-review would otherwise re-review the whole diff each time. Instead `review_runner.py` does an **incremental review**: it diffs only commits added since the last successful review.
 
-- The last-reviewed source HEAD SHA is stored in an **HTML-comment marker** appended to each successful review comment: `<!-- ai-auto-review reviewed-sha: <40-hex> -->`. `build_review_comment()` appends it; `extract_reviewed_sha()` recovers it on the next run from the `discussions` API.
-- This marker is also the **only fingerprint** identifying our service's reviews — since `post_comment()` posts `/review-pr` output verbatim with no service header, a review pasted by hand is otherwise indistinguishable. Marker present ⇒ our review; marker absent ⇒ treated as a user comment.
+- The last-reviewed source HEAD SHA is stored in an **HTML-comment marker** appended to each successful review comment: `<!-- ai-auto-review reviewed-sha: <40-hex> -->`. `build_review_comment()` appends it; `extract_reviewed_sha()` recovers it on the next run from the `discussions` API. `build_review_comment()` truncates the body *before* appending the marker so the post-side length cap can't sever it.
+- This marker is also the **fingerprint** identifying our service's reviews — since `post_comment()` posts `/review-pr` output verbatim with no service header, a review pasted by hand is otherwise indistinguishable. AI-review identification requires marker present **and** `note.author` equal to the token owner (`get_token_username()` via `GET /user`) — this blocks another MR participant from spoofing a marker to hijack the incremental base. If `GET /user` fails it degrades to marker-only matching.
 - Base resolution order: marker SHA → `oldrev` argv (A4 fallback) → none (first review, full diff). If the resolved SHA is not present in the shallow clone, it falls back to a full diff.
-- Incremental mode diffs `git diff <reviewed_sha>..HEAD`; first review keeps the `origin/<target>...HEAD` (or disjoint `..`) path.
-- Prior context: `collect_prior_comments()` pulls the latest AI review (1 only) + all unresolved user comments from `discussions`, excluding system notes, resolved threads, failure notifications, and older AI reviews. `_format_prior_context()` serializes them into a prompt-injection-immune `<untrusted-comments>` block. `fetch_discussions()` failure degrades gracefully to a full review with no prior context.
+- Incremental mode diffs `git diff <reviewed_sha>..HEAD`; first review keeps the `origin/<target>...HEAD` (or disjoint `..`) path. If incremental mode resolves but `reviewed_sha..HEAD` has **zero** new commits (a metadata-only `update` — label/title/assignee change), `run_claude_review()` returns `None` and `main()` skips posting entirely.
+- Prior context: `collect_prior_comments()` pulls the latest AI review (1 only) + all unresolved user comments from `discussions`, excluding system notes, resolved threads, failure notifications, and older AI reviews. `_format_prior_context()` serializes them into a prompt-injection-immune `<untrusted-comments-<nonce>>` block (per-run random nonce defeats block-escape injection). `fetch_discussions()` failure degrades gracefully to a full review with no prior context.
+- `discussions` is `created_at`-ascending, so the **latest** review sits on the last page. `fetch_discussions()` reads `X-Total-Pages` and, when the count exceeds `MAX_DISCUSSION_PAGES`, collects the *last* N pages (not the first) so a busy MR doesn't silently lose its most recent review.
 
 ### Auth model — the load-bearing decision
 
