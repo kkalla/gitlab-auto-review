@@ -18,7 +18,11 @@ pip install -r requirements.txt
 uvicorn webhook_server:app --reload --port 8080
 
 # Trigger review_runner directly (bypasses webhook gate)
-python review_runner.py <project_id> <mr_iid>
+python review_runner.py <project_id> <mr_iid> [oldrev]
+
+# Unit tests (pure functions in review_runner.py)
+pip install -r requirements-dev.txt
+pytest -q
 
 # Smoke tests against a running server
 curl -s http://localhost:8080/healthz
@@ -28,7 +32,7 @@ curl -X POST http://localhost:8080/webhook/gitlab \
   -d '{"object_attributes":{"action":"open","iid":1},"project":{"id":10},"reviewers":[{"username":"max"}]}'
 ```
 
-There is no test suite yet (`requirements.txt` has no pytest).
+Tests cover only `review_runner.py`'s pure functions (marker parsing, comment filtering, injection defense) in `tests/test_review_runner.py`. Test-only deps live in `requirements-dev.txt` — the runtime `requirements.txt` (and the Docker image) deliberately exclude `pytest`. `tests/conftest.py` fills dummy env vars so the module can be imported.
 
 ## Architecture
 
@@ -38,9 +42,10 @@ Two-file pipeline, intentionally split into separate processes:
 GitLab webhook → webhook_server.py (long-lived FastAPI)
                     └─ asyncio.create_subprocess_exec ──> review_runner.py (per-MR, one-shot)
                           ├─ GET /merge_requests/:iid, GET /projects/:id   (메타데이터)
+                          ├─ GET /merge_requests/:iid/discussions  (직전 리뷰·코멘트 수집)
                           ├─ git clone --depth (임시 디렉토리) + target branch fetch
-                          ├─ claude -p "/review-pr\n..."  (클론에서 git diff 직접 실행)
-                          └─ POST /merge_requests/:iid/notes  (성공 리뷰 또는 ⚠️ 실패 알림)
+                          ├─ claude -p "/review-pr\n..."  (클론에서 git diff 직접 실행, 증분 가능)
+                          └─ POST /merge_requests/:iid/notes  (성공 리뷰 + SHA 마커, 또는 ⚠️ 실패 알림)
 ```
 
 Review is **clone-based**: `review_runner.py` shallow-clones the repo into a temp dir and lets `claude` run `git diff` itself — it does **not** fetch diffs via the GitLab API.
@@ -57,6 +62,19 @@ Review is **clone-based**: `review_runner.py` shallow-clones the repo into a tem
 
 Anything else returns `{"status": "skipped", "reason": "..."}` with 200. Don't tighten the filter without updating both the README's example payloads and `TARGET_ACTIONS` together.
 
+`webhook_server.py` also extracts `object_attributes.oldrev` (previous source-branch HEAD on a push) and passes it as the **optional 3rd argv** to `review_runner.py` — `python review_runner.py <project_id> <mr_iid> [oldrev]`. It is only an incremental-review fallback; absence is normal (e.g. local invocation, non-push updates).
+
+### Incremental review
+
+A webhook `update` fires on every push to the MR, so a re-review would otherwise re-review the whole diff each time. Instead `review_runner.py` does an **incremental review**: it diffs only commits added since the last successful review.
+
+- The last-reviewed source HEAD SHA is stored in an **HTML-comment marker** appended to each successful review comment: `<!-- ai-auto-review reviewed-sha: <40-hex> -->`. `build_review_comment()` appends it; `extract_reviewed_sha()` recovers it on the next run from the `discussions` API. `build_review_comment()` truncates the body *before* appending the marker so the post-side length cap can't sever it.
+- This marker is also the **fingerprint** identifying our service's reviews — since `post_comment()` posts `/review-pr` output verbatim with no service header, a review pasted by hand is otherwise indistinguishable. AI-review identification requires marker present **and** `note.author` equal to the token owner (`get_token_username()` via `GET /user`) — this blocks another MR participant from spoofing a marker to hijack the incremental base. If `GET /user` fails it degrades to marker-only matching.
+- Base resolution order: marker SHA → `oldrev` argv (A4 fallback) → none (first review, full diff). If the resolved SHA is not present in the shallow clone, it falls back to a full diff.
+- Incremental mode diffs `git diff <reviewed_sha>..HEAD`; first review keeps the `origin/<target>...HEAD` (or disjoint `..`) path. If incremental mode resolves but `reviewed_sha..HEAD` has **zero** new commits (a metadata-only `update` — label/title/assignee change), `run_claude_review()` returns `None` and `main()` skips posting entirely.
+- Prior context: `collect_prior_comments()` pulls the latest AI review (1 only) + all unresolved user comments from `discussions`, excluding system notes, resolved threads, failure notifications, and older AI reviews. `_format_prior_context()` serializes them into a prompt-injection-immune `<untrusted-comments-<nonce>>` block (per-run random nonce defeats block-escape injection). `fetch_discussions()` failure degrades gracefully to a full review with no prior context.
+- `discussions` is `created_at`-ascending, so the **latest** review sits on the last page. `fetch_discussions()` reads `X-Total-Pages` and, when the count exceeds `MAX_DISCUSSION_PAGES`, collects the *last* N pages (not the first) so a busy MR doesn't silently lose its most recent review. If the `X-Total-Pages` header is absent (older GitLab, proxy), it falls back to forward pagination (stop at a short page, capped at `MAX_DISCUSSION_PAGES`).
+
 ### Auth model — the load-bearing decision
 
 The container has **no Anthropic API key**. It runs `claude` by mounting the host's `~/.claude` into the container (`docker-compose.yml`), reusing the host user's Claude subscription session. Consequences worth remembering:
@@ -67,7 +85,7 @@ The container has **no Anthropic API key**. It runs `claude` by mounting the hos
 
 ### Claude invocation rules
 
-In `run_claude_review()`, the **first line of the prompt must be the slash command** (`/review-pr\n`) — Claude Code only treats it as a slash command in that position. Output is requested in Korean markdown. The CLI's output is posted to the MR **verbatim** — `post_comment()` prepends no header (the `/review-pr` output already carries its own heading). Failures instead post the `⚠️` header — see Failure notification.
+In `run_claude_review()`, the **first line of the prompt must be the slash command** (`/review-pr\n`) — Claude Code only treats it as a slash command in that position. Output is requested in Korean markdown. The CLI's output is posted to the MR **verbatim** — `post_comment()` prepends no header (the `/review-pr` output already carries its own heading). The only thing it adds is the trailing `<!-- ai-auto-review reviewed-sha: … -->` marker (see Incremental review). Failures instead post the `⚠️` header — see Failure notification.
 
 Tool access is gated by a **static** `--allowed-tools` allowlist (`Read,Glob,Grep,Bash(git:*)`), deliberately **not** `--permission-mode auto`: auto mode consults a classifier model on every Bash call, and when that model is "temporarily unavailable" the unattended `-p` run has no one to fall back to — it stalls for the entire `CLAUDE_TIMEOUT_SEC` and is killed. The static allowlist has no model dependency. Don't switch this back to `auto`.
 
@@ -89,6 +107,9 @@ When `review_runner.py` fails (clone/fetch, `claude` non-zero or empty output, G
 | `GIT_CLONE_TIMEOUT_SEC` / `GIT_FETCH_TIMEOUT_SEC` | 120 / 60 | git 작업 타임아웃 |
 | `STDERR_TAIL_LINES` / `MAX_DETAIL_CHARS` | 20 / 4000 | 실패 알림 코멘트 stderr 블록의 줄 수 / 문자 상한 |
 | `MAX_TITLE_CHARS` / `MAX_DESCRIPTION_CHARS` | 200 / 1000 | 프롬프트에 넣기 전 MR 메타데이터 절단 |
+| `MAX_DISCUSSION_PAGES` | 5 | discussions 페이지네이션 상한 (per_page=100 → 최대 500개) |
+| `MAX_PRIOR_REVIEW_CHARS` | 6000 | 프롬프트에 넣을 직전 AI 리뷰 본문 상한 |
+| `MAX_PRIOR_COMMENT_CHARS` / `MAX_PRIOR_COMMENTS_TOTAL` | 1000 / 8000 | 사용자 코멘트 1건 / 전체 합산 상한 |
 
 `cloned_repo()` clones the source branch, fetches the target branch with an explicit refspec, and `_ensure_base_reachable()` deepens until `merge-base` resolves (or falls back to two-dot `..` diff on disjoint history). There is **no** `MAX_FILES` / `MAX_DIFF_CHARS_PER_FILE` truncation — that was the pre-clone, API-diff design and is gone.
 

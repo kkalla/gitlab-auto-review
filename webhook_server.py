@@ -157,6 +157,11 @@ async def handle(
         logger.warning("skip: missing/invalid project.id or object_attributes.iid")
         return {"status": "skipped", "reason": "missing or invalid project_id/mr_iid"}
 
+    # oldrev — source 브랜치 직전 push HEAD. review_runner의 증분 리뷰 fallback
+    # 기준점(축 A·A4). 형식 검증은 review_runner._normalize_oldrev가 담당한다.
+    oldrev_raw = object_attrs.get("oldrev")
+    oldrev = oldrev_raw.strip() if isinstance(oldrev_raw, str) and oldrev_raw.strip() else None
+
     # 7) 동일 MR 중복 차단
     key = (project_id, mr_iid)
     if key in _IN_FLIGHT_MRS:
@@ -164,8 +169,11 @@ async def handle(
         return {"status": "skipped", "reason": "review in progress"}
 
     _IN_FLIGHT_MRS.add(key)
-    logger.info("dispatch: project_id=%s mr_iid=%s", project_id, mr_iid)
-    task = asyncio.create_task(_run_review(project_id, mr_iid))
+    logger.info(
+        "dispatch: project_id=%s mr_iid=%s oldrev=%s",
+        project_id, mr_iid, oldrev or "(없음)",
+    )
+    task = asyncio.create_task(_run_review(project_id, mr_iid, oldrev))
     _RUNNING_TASKS.add(task)
     task.add_done_callback(_RUNNING_TASKS.discard)
     task.add_done_callback(lambda _t, k=key: _IN_FLIGHT_MRS.discard(k))
@@ -173,19 +181,28 @@ async def handle(
     return {"status": "review started"}
 
 
-async def _run_review(project_id: int, mr_iid: int) -> None:
+async def _run_review(
+    project_id: int, mr_iid: int, oldrev: str | None = None
+) -> None:
     """review_runner.py를 별도 프로세스로 실행. 실패해도 서버는 계속 동작.
 
     자식 stdout/stderr는 부모(컨테이너 stdout/stderr)에 그대로 상속 — 자식이 실시간으로
     찍는 진행 로그가 즉시 docker logs에 보이도록 한다. PIPE로 캡처하지 않는다.
+
+    oldrev가 있으면 review_runner의 선택 3번째 인자로 전달 — 증분 리뷰 fallback 기준점.
     """
     try:
-        proc = await asyncio.create_subprocess_exec(
+        argv = [
             sys.executable,
             "-u",  # 자식 Python의 stdout/stderr 버퍼링 끄기 (실시간 flush)
             _REVIEW_RUNNER_PATH,
             str(project_id),
             str(mr_iid),
+        ]
+        if oldrev:
+            argv.append(oldrev)
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
             # stdout/stderr 명시 안 함 = 부모에 상속
         )
         try:
