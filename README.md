@@ -112,6 +112,17 @@ curl -s -X POST http://localhost:8080/webhook/gitlab \
 
 > 한계: 코멘트 게시 자체가 실패하거나(토큰 만료·GitLab 다운) `webhook_server`가 죽으면 알림도 같이 불가능 — 이 사각지대는 설계상 허용된 손실이다.
 
+## 증분 리뷰
+
+MR에 커밋이 push될 때마다 webhook `update`가 발동해 리뷰가 다시 돈다. 매번 전체 diff를 처음부터 리뷰하면 같은 지적이 반복되므로, 2회차부터는 **증분 리뷰**로 동작한다.
+
+- 매 성공 리뷰 코멘트 끝에 그때의 source HEAD SHA를 HTML 주석 마커(`<!-- ai-auto-review reviewed-sha: ... -->`)로 심는다. 사람 눈엔 안 보인다.
+- 다음 회차는 GitLab discussions API로 그 마커를 회수해 `git diff <마커SHA>..HEAD` — 즉 **직전 리뷰 이후 새 커밋만** 리뷰한다.
+- 동시에 직전 AI 리뷰 1건 + 미해결 사용자 코멘트를 프롬프트 context에 넣어, 이미 지적된 사항 중복과 사용자가 반박한 사항을 피한다. resolved 처리된 스레드는 제외된다.
+- 마커가 없으면(첫 리뷰, 또는 코멘트 유실) webhook payload의 `oldrev`로 fallback하고, 그것도 없으면 전체 diff로 리뷰한다.
+
+스모크 테스트: MR에 리뷰가 한 번 달린 뒤 커밋을 push하면, 2회차 리뷰가 새 커밋 범위만 다루고 직전 코멘트를 참고하는지, 코멘트 끝 마커 SHA가 갱신됐는지 확인한다.
+
 ## 트러블슈팅
 
 | 증상 | 원인 | 해결 |
@@ -129,7 +140,7 @@ curl -s -X POST http://localhost:8080/webhook/gitlab \
 
 ## 향후 개선 (스코프 외)
 
-- 인라인 코멘트 (GitLab discussions API)
+- 인라인 코멘트 게시 (현재 discussions API는 증분 리뷰용 읽기 전용으로만 사용)
 - `~/.claude` 마운트 분리 — 호스트 사용자 자격증명 격리 (별도 서비스 계정 Claude 세션)
 - SIGTERM graceful shutdown — 진행 중 자식 프로세스 정리
 - 파일 확장자 필터링
