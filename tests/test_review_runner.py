@@ -224,3 +224,37 @@ def test_build_review_comment_marker_survives_post_note_truncation():
 
 def test_strip_marker_removes_marker_comment():
     assert rr._strip_marker(f"리뷰 내용\n\n{_marker(SHA)}") == "리뷰 내용"
+
+
+# --- _build_diff_mode ----------------------------------------------------
+
+def test_build_diff_mode_incremental_with_reachable_base_uses_3dot_context():
+    diff_hint, disjoint, scope = rr._build_diff_mode(SHA, True, "main")
+    assert f"git diff {SHA}..HEAD" in diff_hint
+    assert "origin/main...HEAD" in diff_hint  # 맥락용 전체 diff는 3점
+    assert disjoint == ""
+    assert "증분 리뷰" in scope
+
+
+def test_build_diff_mode_incremental_with_disjoint_base_uses_2dot_context():
+    # disjoint history에서는 증분 모드의 맥락용 전체 diff도 2점이어야 안 깨진다 (L3).
+    diff_hint, disjoint, scope = rr._build_diff_mode(SHA, False, "main")
+    assert f"git diff {SHA}..HEAD" in diff_hint
+    assert "origin/main...HEAD" not in diff_hint
+    assert "origin/main..HEAD" in diff_hint
+    assert "증분 리뷰" in scope
+
+
+def test_build_diff_mode_full_review_with_reachable_base():
+    diff_hint, disjoint, scope = rr._build_diff_mode(None, True, "main")
+    assert "origin/main...HEAD" in diff_hint
+    assert disjoint == ""
+    assert scope == ""
+
+
+def test_build_diff_mode_full_review_with_disjoint_base():
+    diff_hint, disjoint, scope = rr._build_diff_mode(None, False, "main")
+    assert "origin/main..HEAD" in diff_hint
+    assert "origin/main...HEAD" not in diff_hint
+    assert disjoint != ""
+    assert scope == ""

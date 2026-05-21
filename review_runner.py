@@ -194,14 +194,18 @@ def _http_get(client: httpx.Client, url: str, *, headers: dict) -> httpx.Respons
     raise RuntimeError("GitLab 호출 실패 (재시도 소진)")
 
 
-def _http_get_json(client: httpx.Client, url: str, *, headers: dict) -> Any:
-    resp = _http_get(client, url, headers=headers)
+def _response_json(resp: httpx.Response) -> Any:
+    """httpx 응답을 JSON으로 파싱하되 비-JSON 응답을 RuntimeError로 래핑."""
     try:
         return resp.json()
     except ValueError as e:
         raise RuntimeError(
             f"GitLab 응답이 JSON이 아님 (status={resp.status_code})"
         ) from e
+
+
+def _http_get_json(client: httpx.Client, url: str, *, headers: dict) -> Any:
+    return _response_json(_http_get(client, url, headers=headers))
 
 
 def _http_post_json(
@@ -297,17 +301,39 @@ def fetch_discussions(project_id: int, mr_iid: int) -> list[dict]:
     오름차순이라 **최신** 리뷰는 마지막 페이지에 있다 — 페이지 수가
     `MAX_DISCUSSION_PAGES`를 넘으면 첫 페이지가 아니라 마지막 cap개
     페이지를 수집해야 최신 AI 리뷰를 놓치지 않는다 (M2).
+
+    `X-Total-Pages` 헤더가 없으면(구버전·프록시 등) 페이지 수를 알 수 없어
+    tail 수집이 불가능하다 — 이 경우 순방향으로 cap까지 수집하는 안전망
+    폴백으로 떨어진다.
     """
     headers = {"PRIVATE-TOKEN": PRIVATE_TOKEN}
     base = (
         f"{GITLAB_URL}/api/v4/projects/{project_id}"
         f"/merge_requests/{mr_iid}/discussions"
     )
+    page_url = f"{base}?per_page=100"
     discussions: list[dict] = []
     with httpx.Client(timeout=30.0) as client:
-        first = _http_get(client, f"{base}?per_page=100&page=1", headers=headers)
+        first = _http_get(client, f"{page_url}&page=1", headers=headers)
+        first_batch = _parse_discussions_batch(_response_json(first))
+
+        total_pages_raw = first.headers.get("X-Total-Pages")
+        if not total_pages_raw:
+            # 헤더 부재 — 순방향 수집 폴백 (100개 미만 배치에서 종료, cap 적용).
+            logger.warning("discussions 응답에 X-Total-Pages 없음 — 순방향 수집으로 폴백")
+            discussions.extend(first_batch)
+            if len(first_batch) == 100:
+                for page in range(2, MAX_DISCUSSION_PAGES + 1):
+                    batch = _parse_discussions_batch(
+                        _http_get_json(client, f"{page_url}&page={page}", headers=headers)
+                    )
+                    discussions.extend(batch)
+                    if len(batch) < 100:
+                        break
+            return discussions
+
         try:
-            total_pages = max(int(first.headers.get("X-Total-Pages") or "1"), 1)
+            total_pages = max(int(total_pages_raw), 1)
         except ValueError:
             total_pages = 1
 
@@ -316,21 +342,16 @@ def fetch_discussions(project_id: int, mr_iid: int) -> list[dict]:
                 "discussions %d페이지 — cap(%d) 초과, 최신 %d페이지만 수집",
                 total_pages, MAX_DISCUSSION_PAGES, MAX_DISCUSSION_PAGES,
             )
-            start_page = total_pages - MAX_DISCUSSION_PAGES + 1
+            start_page = total_pages - MAX_DISCUSSION_PAGES + 1  # page 1은 버림
         else:
-            start_page = 1
+            discussions.extend(first_batch)  # page 1 재사용
+            start_page = 2
 
-        if start_page == 1:
-            discussions.extend(_parse_discussions_batch(first.json()))
-            loop_start = 2
-        else:
-            loop_start = start_page
-
-        for page in range(loop_start, total_pages + 1):
-            data = _http_get_json(
-                client, f"{base}?per_page=100&page={page}", headers=headers
+        for page in range(start_page, total_pages + 1):
+            batch = _parse_discussions_batch(
+                _http_get_json(client, f"{page_url}&page={page}", headers=headers)
             )
-            discussions.extend(_parse_discussions_batch(data))
+            discussions.extend(batch)
     return discussions
 
 
@@ -1016,7 +1037,8 @@ def main(project_id: int, mr_iid: int, oldrev: str | None = None) -> int:
     except Exception:
         logger.exception("MR discussions 조회 실패 — 증분/코멘트 없이 전체 리뷰 진행")
 
-    bot_username = get_token_username()  # M1 — AI 리뷰 author 대조용
+    # M1 — AI 리뷰 author 대조용. discussions가 비면 어차피 무의미하므로 호출 생략.
+    bot_username = get_token_username() if discussions else None
     reviewed_sha = (
         extract_reviewed_sha(discussions, bot_username) or _normalize_oldrev(oldrev)
     )
