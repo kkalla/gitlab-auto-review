@@ -136,7 +136,7 @@ MR에 커밋이 push될 때마다 webhook `update`가 발동해 리뷰가 다시
 | `Claude 응답이 비어있음` 로그 | 호스트 세션 만료 | 호스트에서 `claude login` 재실행 (컨테이너 재시작 불필요) |
 | `claude CLI를 PATH에서 찾을 수 없음` | 이미지 빌드 실패 | `docker compose build` 재실행, `docker compose exec ai-reviewer claude --version` 확인 |
 | webhook 이벤트는 오는데 skipped | `action`/`reviewers` 불일치 또는 payload 형식 이상 | `docker compose logs`에서 skip 사유 로그 확인 |
-| `review_runner timeout` 로그 | 리뷰가 외곽 가드(`SUBPROCESS_TIMEOUT_SEC`=1800s) 초과 — claude 자체 한도는 `CLAUDE_TIMEOUT_SEC`=600s | 서버 부하/네트워크 확인. 반복되면 두 값 조정 (외곽이 내부 worst-case보다 커야 실패 알림 코멘트가 게시됨) |
+| `review_runner timeout` 로그 | 리뷰가 외곽 가드(`SUBPROCESS_TIMEOUT_SEC`=2400s) 초과 — claude 자체 한도는 `CLAUDE_TIMEOUT_SEC`=1200s | 서버 부하/네트워크 확인. 반복되면 두 값 조정 (외곽이 내부 worst-case보다 커야 실패 알림 코멘트가 게시됨) |
 
 ## 향후 개선 (스코프 외)
 

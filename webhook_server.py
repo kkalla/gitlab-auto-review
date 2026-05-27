@@ -49,10 +49,10 @@ MAX_REQUEST_BYTES = 1_000_000
 #   GitLab API ~30s + git clone 120s + git fetch 60s
 #   + _ensure_base_reachable deepen 경로 ~600s
 #       (DEEPEN_STEPS 2회 × source/target 각 120s = 480s + --unshallow 120s)
-#   + claude 600s + post_comment/notify_failure ~30s ≈ 1440s.
+#   + claude 1200s + post_comment/notify_failure ~30s ≈ 2040s.
 # 외곽 가드는 반드시 내부 worst-case보다 커야 review_runner가 자체 타임아웃을
 # 처리하고 실패 알림 코멘트를 게시할 수 있다 (작으면 SIGKILL되어 알림 누락).
-SUBPROCESS_TIMEOUT_SEC = 1800  # 30분 — 내부 worst-case ~1440s + 여유
+SUBPROCESS_TIMEOUT_SEC = 2400  # 40분 — 내부 worst-case ~2040s + 여유
 
 # asyncio.create_task 결과를 강참조로 잡아둬야 GC가 mid-run 태스크를 수거하지 않는다.
 _RUNNING_TASKS: set[asyncio.Task] = set()

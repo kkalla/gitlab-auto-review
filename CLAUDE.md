@@ -103,7 +103,7 @@ When `review_runner.py` fails (clone/fetch, `claude` non-zero or empty output, G
 |---|---|---|
 | `CLONE_DEPTH` | 100 | shallow clone 깊이 — 일반적인 MR 분기 폭 커버 |
 | `DEEPEN_STEPS` | (300, 1000) | `merge-base` 미도달 시 점진적 `--deepen`, 최후엔 `--unshallow` |
-| `CLAUDE_TIMEOUT_SEC` | 600 | stalled CLI 강제 종료 |
+| `CLAUDE_TIMEOUT_SEC` | 1200 | stalled CLI 강제 종료 (운영 중 실측: 작은 MR도 `/review-pr`이 Read/Grep 컨텍스트 수집으로 10분 초과하는 케이스 발생) |
 | `GIT_CLONE_TIMEOUT_SEC` / `GIT_FETCH_TIMEOUT_SEC` | 120 / 60 | git 작업 타임아웃 |
 | `STDERR_TAIL_LINES` / `MAX_DETAIL_CHARS` | 20 / 4000 | 실패 알림 코멘트 stderr 블록의 줄 수 / 문자 상한 |
 | `MAX_TITLE_CHARS` / `MAX_DESCRIPTION_CHARS` | 200 / 1000 | 프롬프트에 넣기 전 MR 메타데이터 절단 |
