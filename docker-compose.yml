@@ -2,6 +2,11 @@ services:
   ai-reviewer:
     build: .
     container_name: gitlab-ai-reviewer
+    # PID 1을 tini로 교체해 reparent된 좀비를 거둔다.
+    # uvicorn(=원래 PID 1)은 reaper가 아니라, claude가 CLAUDE_TIMEOUT_SEC로
+    # SIGKILL될 때 그 자식 git 프로세스들이 orphan→PID 1로 reparent되며 좀비로
+    # 쌓였다(운영 중 timeout 다발 시 수십 개 누적 확인). tini는 이를 자동 reap.
+    init: true
     ports:
       - "8080:8080"
     volumes:
