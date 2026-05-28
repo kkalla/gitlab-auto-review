@@ -21,8 +21,11 @@ uvicorn webhook_server:app --reload --port 8080
 python review_runner.py <project_id> <mr_iid> [oldrev]
 
 # Unit tests (pure functions in review_runner.py)
-pip install -r requirements-dev.txt
-pytest -q
+# 격리 venv에서 실행 — 호스트 conda(cv2 등) 오염을 피한다. venv는 멱등 생성.
+make test
+
+# (수동) 직접 venv 구성
+python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt && .venv/bin/pytest -q
 
 # Smoke tests against a running server
 curl -s http://localhost:8080/healthz
