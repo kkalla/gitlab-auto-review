@@ -26,6 +26,8 @@ from urllib.parse import urlparse
 
 import httpx
 
+import slack_notifier
+
 _LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     level=getattr(logging, _LOG_LEVEL, logging.INFO),
@@ -67,6 +69,11 @@ PRIVATE_TOKEN = _required_env("GITLAB_TOKEN")
 # 리뷰 실패 시 알림 코멘트에서 @멘션할 대상.
 # webhook_server와 동일 컨테이너 env를 공유하므로 그대로 읽으면 된다.
 REVIEWER_USERNAME = os.environ.get("REVIEWER_USERNAME", "max").strip().lstrip("@") or "max"
+
+# 리뷰 완료/실패 시 DM할 리뷰어("나")의 Slack member ID(U…). 비어 있으면 리뷰어
+# DM은 생략된다(assignee DM은 이메일 매핑으로 별도 처리). best-effort 알림이라
+# 없어도 리뷰 파이프라인 자체는 그대로 동작한다.
+REVIEWER_SLACK_ID = os.environ.get("REVIEWER_SLACK_ID", "").strip()
 
 # 입력/실행 한도
 MAX_DESCRIPTION_CHARS = 1000
@@ -295,6 +302,31 @@ def get_token_username() -> str | None:
         uname = user.get("username")
         if isinstance(uname, str) and uname:
             return uname
+    return None
+
+
+def get_user_public_email(user_id: int) -> str | None:
+    """GitLab 사용자의 이메일 조회 (assignee → Slack 매핑용). 실패/비공개 시 None.
+
+    GitLab MR의 assignee 객체에는 이메일이 들어 있지 않으므로 /users/:id로 별도
+    조회한다. 일반 PAT로는 보통 `public_email`(사용자가 프로필에서 공개 설정한
+    경우)만 채워지고, 관리자 토큰이면 `email`도 온다. 둘 다 비면 Slack 매핑이
+    불가하므로 해당 assignee 알림은 건너뛴다(best-effort).
+    """
+    headers = {"PRIVATE-TOKEN": PRIVATE_TOKEN}
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            user = _http_get_json(
+                client, f"{GITLAB_URL}/api/v4/users/{user_id}", headers=headers
+            )
+    except Exception:
+        logger.exception("GitLab 사용자 %s 조회 실패 — Slack 매핑 생략", user_id)
+        return None
+    if isinstance(user, dict):
+        for key in ("public_email", "email"):
+            val = user.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
     return None
 
 
@@ -878,13 +910,13 @@ def run_claude_review(
 
     # claude 서브프로세스에서 자격증명 env를 제거한다.
     # clone/fetch는 이 함수 호출 전에 이미 끝났고, claude는 클론된 로컬 레포에서
-    # git diff/log/show만 돌리므로 GITLAB_TOKEN·WEBHOOK_SECRET이 전혀 필요 없다.
-    # `Bash(git:*)` 화이트리스트는 임의 명령 실행을 완전히 막지 못한다 —
-    # `git -c core.pager=!cmd`, `diff.external`, `!`-alias 등이 모두 `git ` 접두사라
-    # 매칭된다. prompt injection이 성공해도 토큰 자체가 env에 없으면 유출 불가.
+    # git diff/log/show만 돌리므로 GITLAB_TOKEN·WEBHOOK_SECRET·SLACK_* 모두 불필요하다.
+    # 현재 ALLOWED_TOOLS가 full Bash를 허용(실험)하므로 prompt injection 시 임의 shell
+    # 실행이 가능하다 — env에 토큰이 남아 있으면 그대로 유출된다. 따라서 Slack 봇/앱
+    # 토큰도 반드시 함께 벗긴다. (호스트 ~/.claude 세션 토큰은 마운트라 env 밖 — 별도 위험.)
     claude_env = {
         k: v for k, v in os.environ.items()
-        if k not in {"GITLAB_TOKEN", "WEBHOOK_SECRET"}
+        if k not in {"GITLAB_TOKEN", "WEBHOOK_SECRET", "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN"}
     }
 
     # stdout/stderr 모두 PIPE로 캡처 — stderr는 실패 알림 코멘트의 재료가 되고,
@@ -979,20 +1011,93 @@ def post_comment(
     _post_note(project_id, mr_iid, build_review_comment(review, head_sha))
 
 
+def _collect_slack_recipients(mr: dict) -> list[str]:
+    """완료 DM을 받을 Slack member ID 목록 — 리뷰어("나") + assignee(이메일 매핑).
+
+    리뷰어는 REVIEWER_SLACK_ID로 직접, assignee는 GitLab 이메일 → Slack
+    users.lookupByEmail로 해석한다. 중복은 제거한다. 이메일이 비공개거나 매핑이
+    안 되는 assignee는 조용히 건너뛴다.
+    """
+    ids: list[str] = []
+    seen: set[str] = set()
+
+    if REVIEWER_SLACK_ID:
+        ids.append(REVIEWER_SLACK_ID)
+        seen.add(REVIEWER_SLACK_ID)
+
+    assignees = mr.get("assignees")
+    if isinstance(assignees, list):
+        for a in assignees:
+            if not isinstance(a, dict):
+                continue
+            email: str | None = None
+            for key in ("public_email", "email"):  # MR 객체에 있으면 우선(보통 없음)
+                v = a.get(key)
+                if isinstance(v, str) and v.strip():
+                    email = v.strip()
+                    break
+            if not email and isinstance(a.get("id"), int):
+                email = get_user_public_email(a["id"])
+            if not email:
+                continue
+            sid = slack_notifier.lookup_user_id_by_email(email)
+            if sid and sid not in seen:
+                ids.append(sid)
+                seen.add(sid)
+    return ids
+
+
+def notify_slack_success(mr: dict, project_id: int, mr_iid: int) -> None:
+    """리뷰 완료를 리뷰어·assignee에게 Slack DM으로 알린다 (best-effort).
+
+    Slack 미설정(SLACK_BOT_TOKEN 없음)이거나 전송 실패해도 예외를 던지지 않는다 —
+    MR 코멘트가 이미 게시된 뒤이므로 알림 누락이 리뷰 결과를 깨뜨리면 안 된다.
+    """
+    if not slack_notifier.enabled():
+        return
+    try:
+        web_url = _safe_str(mr.get("web_url"), "")
+        title = _safe_str(mr.get("title"), f"MR !{mr_iid}")
+        link = f"<{web_url}|MR !{mr_iid} · {title}>" if web_url else f"MR !{mr_iid}"
+        text = (
+            f"✅ *AI 코드 리뷰 완료* — {link}\n"
+            "MR에 리뷰 코멘트를 남겼습니다. 확인해 주세요."
+        )
+        recipients = _collect_slack_recipients(mr)
+        if not recipients:
+            logger.info("Slack 완료 알림 수신자 없음 — 생략")
+            return
+        sent = sum(1 for uid in recipients if slack_notifier.send_dm(uid, text))
+        logger.info("Slack 완료 알림 전송: %d/%d", sent, len(recipients))
+    except Exception:
+        logger.exception("Slack 완료 알림 실패 (best-effort) — 무시")
+
+
 def notify_failure(
     project_id: int, mr_iid: int, stage: str, reason: str, detail: str = ""
 ) -> None:
-    """리뷰 실패를 MR 코멘트로 알린다 (best-effort).
+    """리뷰 실패를 MR 코멘트 + 리뷰어 Slack DM으로 알린다 (best-effort).
 
-    @멘션 코멘트로 GitLab 메일 알림을 트리거한다. 게시 자체가 실패하면(토큰 만료,
-    GitLab 다운 등) 로그만 남긴다 — 알림 수단과 실패 수단이 겹치는 사각지대로,
-    설계상 허용된 손실이다.
+    @멘션 코멘트로 GitLab 메일 알림을 트리거하고, 추가로 리뷰어에게 Slack DM을
+    보낸다. 게시/전송이 실패해도(토큰 만료, GitLab/Slack 다운 등) 로그만 남긴다 —
+    알림 수단과 실패 수단이 겹치는 사각지대로, 설계상 허용된 손실이다.
     """
     try:
         _post_note(project_id, mr_iid, build_failure_comment(stage, reason, detail))
         logger.info("실패 알림 코멘트 게시 완료 (stage=%s)", stage)
     except Exception:
         logger.exception("실패 알림 코멘트 게시 불가 — 로그만 남김 (stage=%s)", stage)
+
+    if slack_notifier.enabled() and REVIEWER_SLACK_ID:
+        try:
+            text = (
+                f"⚠️ *AI 코드 리뷰 실패* — MR !{mr_iid} (project {project_id})\n"
+                f"• 단계: {stage}\n"
+                f"• 추정 원인: {reason}"
+            )
+            slack_notifier.send_dm(REVIEWER_SLACK_ID, text)
+        except Exception:
+            logger.exception("Slack 실패 알림 전송 불가 — 로그만 남김")
 
 
 def main(project_id: int, mr_iid: int, oldrev: str | None = None) -> int:
@@ -1114,6 +1219,8 @@ def main(project_id: int, mr_iid: int, oldrev: str | None = None) -> int:
                     "MR 노트 게시 실패 (project=%s mr=%s)", project_id, mr_iid
                 )
                 return 1
+            # MR 코멘트 게시 성공 후에만 완료 DM — best-effort, 실패해도 무시.
+            notify_slack_success(mr, project_id, mr_iid)
     except Exception as e:
         logger.exception(
             "repo clone/fetch 실패 (project=%s mr=%s)", project_id, mr_iid
