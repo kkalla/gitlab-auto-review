@@ -3,17 +3,42 @@ services:
     build: .
     container_name: gitlab-ai-reviewer
     # PID 1을 tini로 교체해 reparent된 좀비를 거둔다.
-    # uvicorn(=원래 PID 1)은 reaper가 아니라, claude가 CLAUDE_TIMEOUT_SEC로
+    # 봇/uvicorn(=원래 PID 1)은 reaper가 아니라, claude가 CLAUDE_TIMEOUT_SEC로
     # SIGKILL될 때 그 자식 git 프로세스들이 orphan→PID 1로 reparent되며 좀비로
     # 쌓였다(운영 중 timeout 다발 시 수십 개 누적 확인). tini는 이를 자동 reap.
     init: true
-    ports:
-      - "8080:8080"
+    # claude는 시작 시 ~/.claude.json을 임시파일+atomic rename으로 재작성한다.
+    # 그런데 ${HOME}/.claude.json을 단일 파일로 직접 bind-mount하면(특히 podman
+    # machine의 virtiofs 공유), rename 교체가 실패해 원본이 사라지고
+    # "Claude configuration file not found at /root/.claude.json"로 깨진다.
+    # → 호스트 파일은 읽기전용 seed로만 넣고(:ro), 시작 시 컨테이너 로컬(overlay)로
+    #   복사한다. claude는 로컬 파일을 자유롭게 재작성할 수 있다.
+    # 트레이드오프: 컨테이너 내 토큰 갱신이 호스트로 역동기화되지 않는다. 재시작 때
+    #   호스트 seed에서 다시 복사되고 claude가 OAuth refresh로 재인증한다(정상 동작).
+    entrypoint: ["/bin/sh", "-c", "cp /seed/.claude.json /root/.claude.json && exec \"$@\"", "--"]
+    # Slack 봇 모드(기본 CMD=slack_bot.py)는 아웃바운드 WebSocket만 쓰므로 공개
+    # inbound 포트가 필요 없다. webhook 모드로 되돌릴 때만 아래 command + ports를 켠다
+    # (entrypoint가 seed 복사 후 이 command를 exec하므로 webhook 모드에서도 동작):
+    #   command: ["uvicorn", "webhook_server:app", "--host", "0.0.0.0", "--port", "8080"]
+    #   ports:
+    #     - "8080:8080"
+    command: ["python", "slack_bot.py"]
     volumes:
       # 호스트의 Claude 구독 credentials 마운트 (핵심).
       # rw 필수 — claude의 Bash 도구가 ~/.claude/shell-snapshots/에 쓰고,
       # OAuth 토큰 갱신도 쓰기가 필요하다. :ro면 EROFS로 Bash 도구가 깨진다.
-      - ~/.claude:/root/.claude
+      #
+      # `${HOME}` 사용: compose는 `~`를 확장하지 않으므로 환경변수로 적는다.
+      # ─ macOS + Podman: podman machine VM이 기본적으로 $HOME을 동일 경로로 공유하므로
+      #   이 경로가 컨테이너까지 그대로 전달된다. macOS엔 SELinux가 없으니 `:z`/`:Z`를
+      #   **붙이지 말 것** (virtiofs 공유 마운트에 라벨을 붙이면 오히려 실패한다).
+      # ─ Linux + SELinux(enforcing) 호스트에 배포할 때만 끝에 `:z`를 추가한다:
+      #     - ${HOME}/.claude:/root/.claude:z
+      - ${HOME}/.claude:/root/.claude
+      # ~/.claude.json은 직접 마운트하지 않는다(위 entrypoint 참고). 읽기전용 seed로만
+      # 넣고 시작 시 컨테이너 로컬로 복사한다. 호스트에 이 파일이 존재해야 한다
+      # (호스트에서 `claude login`을 한 번이라도 했다면 존재한다).
+      - ${HOME}/.claude.json:/seed/.claude.json:ro
     env_file:
       - .env
     restart: unless-stopped
