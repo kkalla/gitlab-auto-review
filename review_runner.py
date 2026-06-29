@@ -98,20 +98,29 @@ RETRY_ATTEMPTS = 2
 # "temporarily unavailable" 상태면 -p(비대화) 모드에서 물어볼 대상이 없어 무한
 # 대기하다 타임아웃난다. 정적 화이트리스트는 모델 의존이 없어 결정적이다.
 #
-# [EXPERIMENT] /review-pr 스킬의 서브에이전트(code-reviewer·pr-test-analyzer 등)를
-# 실제로 띄우기 위해 `Task`를 추가하고 `Bash`를 전체 개방했다. 서브에이전트 frontmatter가
-# `tools: [Read, Grep, Glob, Bash]`(무제한 Bash)을 요구하므로, -p 무인 실행에서 자동승인
-# 되려면 allowlist도 Bash 전체를 허용해야 한다.
-#
-# !!! 보안 위험(실험 한정, 격리 환경에서만) !!!
-# - 이전엔 git 외 Bash를 차단해 임의 명령 실행 표면을 좁혔다. 이제 전체 Bash가 정식 허용된다.
-# - MR 제목/설명/diff/코멘트는 외부 사용자 입력(prompt injection 대상)이다. injection이
-#   성공하면 서브에이전트가 임의 shell로 read-write 마운트된 호스트 ~/.claude 의
-#   OAuth 토큰(~/.claude/.credentials.json 등)을 읽어 유출할 수 있다. claude_env가
-#   벗기는 건 GITLAB_TOKEN/WEBHOOK_SECRET뿐, 호스트 세션 토큰은 보호 밖이다.
-# - 운영 복귀 시 "Read,Glob,Grep,Bash(git:*)"로 되돌리거나, ~/.claude 마운트 노출을
-#   먼저 축소할 것.
+# 메인 에이전트는 Bash(git:*)로 좁혀 임의 shell 실행 표면을 제한한다. Task는 /review-pr
+# 서브에이전트(code-reviewer·pr-test-analyzer 등) 스폰에 필요 — 없으면 단일 패스로 축소된다.
+# 단, 부모 --allowed-tools는 Task 서브에이전트에 전파되지 않으므로(claude 설계) 각 서브에이전트
+# 정의(호스트 ~/.claude/agents/)에서도 별도로 Bash(git:*)로 좁혀야 한다(이 repo 밖, 배포 시 필수).
+# Bash(git:*)도 `git -c core.pager=…`/`git -c http.extraHeader=…` 등으로 우회 가능해 완전한
+# RCE 차단은 아니다 — CLAUDE_CODE_OAUTH_TOKEN을 strip할 수 없는 구조상 이 스코핑이 1차 방어선이다.
 ALLOWED_TOOLS = "Read,Glob,Grep,Bash(git:*),Task"
+
+# claude 서브프로세스에서 가릴 비밀 env. 명시 키 + 비밀스러운 접미사를 차단하는
+# fail-secure denylist — .env에 새 *_TOKEN/_SECRET/_KEY가 추가돼도 수동 갱신 없이
+# 자동으로 가려진다. CLAUDE_CODE_OAUTH_TOKEN만 claude 인증에 필요해 예외로 통과한다.
+_SECRET_ENV_KEYS = frozenset(
+    {"GITLAB_TOKEN", "WEBHOOK_SECRET", "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN"}
+)
+_SECRET_ENV_SUFFIXES = ("_TOKEN", "_SECRET", "_KEY", "_PASSWORD", "_PASSWD")
+
+
+def _is_secret_env(key: str) -> bool:
+    """claude env에서 가려야 할 비밀 키인지. CLAUDE_CODE_OAUTH_TOKEN은 예외(인증 필요)."""
+    if key == "CLAUDE_CODE_OAUTH_TOKEN":
+        return False
+    return key in _SECRET_ENV_KEYS or key.endswith(_SECRET_ENV_SUFFIXES)
+
 
 # git credential helper — PAT를 env var(GITLAB_TOKEN)로 전달 (ps 노출 회피)
 GIT_CREDENTIAL_HELPER = (
@@ -966,12 +975,7 @@ def run_claude_review(
     # 서브에이전트 정의 자체를 좁혀야 한다) 임의 shell 실행 경로를 줄였다. 그래도 best-effort
     # 방어로 토큰은 strip한다 — 단 CLAUDE_CODE_OAUTH_TOKEN은 claude 인증에 필요해 strip
     # 못 하므로(env에 남음), Bash 스코핑이 그 토큰을 지키는 1차 방어가 된다.
-    claude_env = {
-        k: v
-        for k, v in os.environ.items()
-        if k
-        not in {"GITLAB_TOKEN", "WEBHOOK_SECRET", "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN"}
-    }
+    claude_env = {k: v for k, v in os.environ.items() if not _is_secret_env(k)}
 
     # stdout/stderr 모두 PIPE로 캡처 — stderr는 실패 알림 코멘트의 재료가 되고,
     # 캡처 후 logger로 재출력해 docker logs 가시성도 유지한다.
