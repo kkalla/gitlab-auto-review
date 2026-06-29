@@ -9,9 +9,19 @@ FastAPI service that receives GitLab MR webhooks and posts AI code review commen
 ## Run / debug
 
 ```bash
-# Production-like
+# Production-like (Docker)
 docker compose up -d --build
 docker compose logs -f ai-reviewer
+
+# Production-like (Podman, macOS — 권장 타깃)
+# 1) Linux VM 준비 (최초 1회). claude+node+git이라 리소스는 넉넉히.
+podman machine init --cpus 4 --memory 4096   # 이미 있으면 생략
+podman machine start
+# 2) podman compose는 docker-compose/podman-compose 중 설치된 provider를 호출한다.
+podman compose up -d --build
+podman compose logs -f ai-reviewer
+# 마운트되는 ${HOME}/.claude·${HOME}/.claude.json은 호스트에서 `claude login`이
+# 끝나 있어야 한다(컨테이너가 그 세션을 재사용). macOS엔 SELinux가 없어 `:z` 불필요.
 
 # Local Python (still requires env vars from .env)
 pip install -r requirements.txt
@@ -56,6 +66,36 @@ Review is **clone-based**: `review_runner.py` shallow-clones the repo into a tem
 - **`webhook_server.py`** — webhook validation, filtering, dispatch only. Never blocks on review work; spawns `review_runner.py` as a subprocess so a crash there can't take the server down.
 - **`review_runner.py`** — does the actual API calls and Claude invocation. Designed to be invokable standalone for local testing.
 
+### Two trigger entrypoints (둘 중 하나만 띄움)
+
+`review_runner.py`는 두 트리거가 공유한다. **하나의 컨테이너 이미지, 두 진입점:**
+
+1. **`webhook_server.py`** (webhook 모드) — GitLab MR webhook을 공개 HTTP로 받음. `WEBHOOK_SECRET` 필요, `ports: 8080` 노출.
+2. **`slack_bot.py`** (Slack 봇 모드, **기본 CMD**) — Slack Socket Mode 봇. **공개 inbound 포트 불필요** — 봇이 Slack으로 아웃바운드 WebSocket을 연다(방화벽/NAT 무관). 트리거 **세 가지**: **자동·채널알림**(GitLab Slack notification이 뿌린 MR 링크를 `message` 이벤트로 잡음 — 주로 MR open) / **자동·폴링**(봇이 `POLL_INTERVAL_SEC`마다 reviewer 지정 열린 MR의 source SHA를 확인해 변경분을 리뷰 — **push 증분의 길**; GitLab Slack 알림은 MR push를 채널에 안 띄우므로 필요) / **수동·멘션**(`@mr-reviewer <MR URL>`). 설정은 `SLACK_SETUP.md`.
+
+```
+(자동·채널) GitLab 알림 → 채널 message → slack_bot.py (handle_channel_message)
+(자동·폴링) POLL_INTERVAL_SEC마다 GET /merge_requests?reviewer_username=… → SHA 변경분 (_poll_loop)
+(수동·멘션) @봇 <MR URL> → slack_bot.py (app_mention)
+                 ├─ MR URL/목록에서 project_id·mr_iid 해석
+                 ├─ (멘션/채널만) 스레드 ack 답글
+                 └─ subprocess ──> review_runner.py <project_id> <mr_iid>
+                                     └─ (기존 파이프라인) + 완료/실패 시 Slack DM
+```
+
+- `slack_bot.py`는 `webhook_server.py`와 같은 격리 원칙: review_runner를 **subprocess**로 띄워 claude 타임아웃 SIGKILL/크래시가 봇 WebSocket을 죽이지 못하게 한다. 리뷰는 Bolt 핸들러/폴러를 막지 않도록 별도 `threading.Thread`에서 실행.
+- 세 트리거는 `_dispatch_review()`를 공유하고 `(project_id, mr_iid)` in-flight 가드로 중복을 막는다 — 멘션 메시지는 `app_mention`·`message` 둘 다 발생하지만 먼저 잡은 쪽만 실행된다. 봇 자신의 답글이 `message`로 되돌아와 재트리거되는 것은 Bolt 기본 `ignoring_self_events`가 막는다.
+- **폴러**(`_poll_loop`, 데몬 스레드)는 첫 순회를 **baseline**으로 잡고(봇 기동 시 기존 MR 일괄 리뷰 방지) 이후 source SHA가 바뀐 MR만 트리거한다. 폴링 트리거는 `channel`/`say` 없이 `_dispatch_review`를 호출해 **스레드 답글 없이 조용히** 돌고(결과는 review_runner의 MR 코멘트 + DM), `_post`는 `channel`이 없으면 no-op이다. `POLL_INTERVAL_SEC=0`이면 폴러 비활성화. 봇 재시작 시 baseline이 비어 그 사이 push는 한 번 놓칠 수 있다(수동 멘션으로 커버).
+- 봇은 oldrev를 넘기지 않는다 — 증분 리뷰는 review_runner가 MR 코멘트의 `reviewed-sha` 마커로 자체 처리하므로 `@멘션` 수동 트리거에서도 정상 동작한다.
+- `slack_bot.py`만 `slack_bolt`에 의존한다. `review_runner.py`/`slack_notifier.py`는 `httpx`만 쓴다 — review_runner의 테스트 의존성을 가볍게 유지하기 위함(테스트는 `slack_bolt` 미설치로도 통과).
+
+### Slack 알림 (`slack_notifier.py`)
+
+`review_runner.py`는 리뷰 **완료**(`notify_slack_success`) 시 리뷰어+assignee에게, **실패**(`notify_failure`) 시 리뷰어에게 Slack DM을 보낸다. 모두 **best-effort** — `SLACK_BOT_TOKEN`이 없으면 `slack_notifier.enabled()`가 False라 조용히 no-op이고, 전송 실패도 예외를 던지지 않는다(MR 코멘트가 이미 게시된 뒤이므로 알림 누락이 리뷰 결과를 깨선 안 됨).
+
+- 리뷰어 DM 대상은 `REVIEWER_SLACK_ID`(Slack member ID)로 직접 지정.
+- assignee는 **GitLab 이메일 → Slack `users.lookupByEmail`**로 매핑. GitLab MR의 assignee 객체엔 이메일이 없어 `get_user_public_email()`이 `/users/:id`의 `public_email`을 별도 조회한다. 공개 이메일이 비었거나 Slack 이메일과 다르면 그 assignee는 건너뛴다(설계상 허용된 누락).
+
 ### Webhook filter contract (must hold for a review to fire)
 
 1. `X-Gitlab-Token` header equals `WEBHOOK_SECRET` (else 401).
@@ -80,11 +120,13 @@ A webhook `update` fires on every push to the MR, so a re-review would otherwise
 
 ### Auth model — the load-bearing decision
 
-The container has **no Anthropic API key**. It runs `claude` by mounting the host's `~/.claude` into the container (`docker-compose.yml`), reusing the host user's Claude subscription session. Consequences worth remembering:
+The container authenticates `claude` with a **long-lived OAuth token** (`CLAUDE_CODE_OAUTH_TOKEN`, from `claude setup-token` on the host) — a Claude **subscription** token, **not** `ANTHROPIC_API_KEY`. Why a token env var instead of just mounting the host session:
 
-- The host `~/.claude` is mounted **read-write**. Claude Code's Bash tool writes shell snapshots under `~/.claude/shell-snapshots/`, and OAuth token refresh also needs write access — a `:ro` mount breaks the Bash tool with `EROFS`. Don't re-add `:ro`.
-- If `claude -p` returns non-zero, the most common cause is host session expiry, not container state. Tell the user to re-run `claude login` on the **host**.
-- Don't add code paths that assume `ANTHROPIC_API_KEY`; that env var is intentionally absent.
+- **macOS Keychain isn't portable.** The host (macOS) stores its OAuth token in the Keychain, which the Linux container can't read. Mounting `~/.claude` / `~/.claude.json` carries config but **not** the token — `claude -p` then fails with `Not logged in`. `claude setup-token` prints a ~1-year token that bypasses Keychain; it flows `.env` → compose `env_file` → `review_runner`'s `claude_env` → the `claude` subprocess.
+- `~/.claude` is still mounted **read-write** (Claude Code's Bash tool writes `~/.claude/shell-snapshots/`; a `:ro` mount breaks it with `EROFS`). But `~/.claude.json` is **not** mounted directly: a single-file bind mount + podman virtiofs breaks claude's atomic-rename rewrite of that file (it vanishes → `Claude configuration file not found`). Instead it's mounted **read-only at `/seed/.claude.json`** and the compose `entrypoint` copies it to a container-local `/root/.claude.json` on start. See `docker-compose.yml`.
+- If `claude -p` fails with `Not logged in`, the token is missing/expired — re-run `claude setup-token` on the host and update `CLAUDE_CODE_OAUTH_TOKEN` in `.env`. (The `/login` short-lived OAuth token dies in ~8h with no refresh; the `setup-token` long-lived token does not — use setup-token.)
+- `ANTHROPIC_API_KEY` stays intentionally absent — auth is the subscription OAuth token, not the API.
+- **Security trade-off**: `CLAUDE_CODE_OAUTH_TOKEN` must reach the `claude` subprocess (it *is* the auth), so `claude_env` passes it through — unlike the stripped secrets. With `ALLOWED_TOOLS` permitting full `Bash`, a prompt-injection could read it from env; narrowing the allowlist back to `Bash(git:*)` shrinks that surface.
 
 ### Claude invocation rules
 
@@ -92,7 +134,7 @@ In `run_claude_review()`, the **first line of the prompt must be the slash comma
 
 Tool access is gated by a **static** `--allowed-tools` allowlist (`Read,Glob,Grep,Bash(git:*)`), deliberately **not** `--permission-mode auto`: auto mode consults a classifier model on every Bash call, and when that model is "temporarily unavailable" the unattended `-p` run has no one to fall back to — it stalls for the entire `CLAUDE_TIMEOUT_SEC` and is killed. The static allowlist has no model dependency. Don't switch this back to `auto`.
 
-`Bash(git:*)` does **not** by itself prevent arbitrary command execution — `git -c core.pager=…`, `git -c diff.external=…`, and `!`-aliases all run a shell and all match the `git ` prefix. So the allowlist is a surface-reducer, not an RCE seal. The actual defense against credential theft is **env isolation**: `run_claude_review()` builds a `claude_env` that strips `GITLAB_TOKEN` and `WEBHOOK_SECRET` and passes it as `env=`. `claude` only runs local git (`diff`/`log`/`show`) on the already-cloned repo — clone/fetch finished before it starts — so it needs neither secret. Never pass the full process environment to the `claude` subprocess.
+`Bash(git:*)` does **not** by itself prevent arbitrary command execution — `git -c core.pager=…`, `git -c diff.external=…`, and `!`-aliases all run a shell and all match the `git ` prefix. So the allowlist is a surface-reducer, not an RCE seal. The actual defense against credential theft is **env isolation**: `run_claude_review()` builds a `claude_env` that strips `GITLAB_TOKEN`, `WEBHOOK_SECRET`, `SLACK_BOT_TOKEN`, and `SLACK_APP_TOKEN`, and passes it as `env=`. (Slack 토큰도 반드시 벗긴다 — 현재 `ALLOWED_TOOLS`가 full `Bash`를 허용하므로 injection 성공 시 임의 shell이 env를 읽을 수 있다.) `claude` only runs local git (`diff`/`log`/`show`) on the already-cloned repo — clone/fetch finished before it starts — so it needs neither secret. Never pass the full process environment to the `claude` subprocess.
 
 ### Failure notification
 
@@ -118,12 +160,22 @@ When `review_runner.py` fails (clone/fetch, `claude` non-zero or empty output, G
 
 ## Required env vars
 
-All consumed at import time (`os.environ[...]` — missing keys crash on boot, by design):
+Consumed at import time (`os.environ[...]` — missing keys crash on boot, by design). 어떤 키가 필수인지는 **어느 진입점을 띄우느냐**에 따라 다르다:
 
+공통 (`review_runner.py`):
 - `GITLAB_URL` — base URL, no trailing slash (stripped defensively anyway).
 - `GITLAB_TOKEN` — PAT with `api` scope.
-- `WEBHOOK_SECRET` — must match GitLab webhook Secret Token.
-- `REVIEWER_USERNAME` (default `max`) — used by **both** processes: in `webhook_server.py` it gates which `reviewers[].username` triggers a review; in `review_runner.py` it is the `@`-mention target of the failure-notification comment.
+- `CLAUDE_CODE_OAUTH_TOKEN` — `claude setup-token`(호스트 실행)으로 발급한 구독 OAuth 토큰. `claude` 인증에 쓰인다 — 컨테이너는 macOS Keychain을 못 읽으므로 **필수**(없으면 `claude -p`가 `Not logged in`). import가 아니라 claude 실행 시점에 필요. Auth model 섹션 참고.
+- `REVIEWER_USERNAME` (default `max`) — `webhook_server.py`에선 `reviewers[].username` 필터, `review_runner.py`에선 실패 알림 코멘트의 `@`-mention 대상, `slack_bot.py` 폴러에선 폴링 대상 MR의 `reviewer_username` 필터.
+
+webhook 모드 (`webhook_server.py`):
+- `WEBHOOK_SECRET` — must match GitLab webhook Secret Token. (Slack 봇 모드에선 불필요.)
+
+Slack 봇 모드 (`slack_bot.py`):
+- `SLACK_BOT_TOKEN` (`xoxb-…`) — bot 토큰. 스코프 `chat:write, app_mentions:read, users:read, users:read.email, im:write`. 봇 부팅 필수이며, `review_runner.py`에선 **선택**(없으면 DM 알림만 no-op).
+- `SLACK_APP_TOKEN` (`xapp-…`) — App-Level 토큰, `connections:write`. Socket Mode 전용. 봇 부팅 필수.
+- `REVIEWER_SLACK_ID` (`U…`) — 완료/실패 DM을 받을 리뷰어 member ID. 선택 — 비면 리뷰어 DM 생략(assignee DM은 이메일 매핑으로 별도).
+- `POLL_INTERVAL_SEC` (default 300) — 폴러 주기(초). reviewer 지정 열린 MR의 source SHA를 이 주기로 확인해 push 증분을 자동 리뷰한다. `0`이면 폴러 비활성화(채널알림·멘션만). slack_bot 전용.
 
 ## Conventions
 
