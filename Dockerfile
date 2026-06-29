@@ -22,8 +22,10 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY webhook_server.py review_runner.py ./
+COPY webhook_server.py review_runner.py slack_bot.py slack_notifier.py ./
 
-EXPOSE 8080
-
-CMD ["uvicorn", "webhook_server:app", "--host", "0.0.0.0", "--port", "8080"]
+# 기본 진입점 = Slack Socket Mode 봇 (공개 inbound 포트 불필요 — 봇이 아웃바운드
+# WebSocket을 연다). webhook 모드로 돌리려면 compose에서 command를 아래로 덮어쓴다:
+#   command: ["uvicorn", "webhook_server:app", "--host", "0.0.0.0", "--port", "8080"]
+# (그 경우 ports: ["8080:8080"]도 함께 노출할 것.)
+CMD ["python", "slack_bot.py"]
