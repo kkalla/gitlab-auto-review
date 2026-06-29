@@ -360,12 +360,13 @@ def _fetch_open_reviewer_mrs() -> list[dict]:
 
 
 def _poll_loop() -> None:
-    """주기적으로 리뷰어 지정 열린 MR을 폴링해 새 push(SHA 변경)를 자동 리뷰한다.
+    """주기적으로 리뷰어 지정 열린 MR을 폴링해 새로 열린 MR과 새 push를 자동 리뷰한다.
 
     GitLab Slack 알림은 MR push를 채널에 안 띄우므로(message 자동 트리거 불가) 폴링으로
-    보완한다. 첫 순회는 baseline만 잡고(봇 기동 시 기존 MR 일괄 리뷰 방지) 이후 source
-    SHA가 바뀐 MR만 트리거한다. 실제 증분/스킵 판단(새 커밋 0개면 스킵)은 review_runner의
-    reviewed-sha 마커가 처리하므로, 폴러는 "SHA 변경 → 호출"만 담당한다.
+    보완한다. 첫 순회는 baseline만 잡고(봇 기동 시 기존 MR 일괄 리뷰 방지) 이후 **기동 후
+    새로 열린 MR**(seen에 없던 것)과 **source SHA가 바뀐 MR**(새 push)을 트리거한다. 실제
+    증분/스킵 판단(새 커밋 0개면 스킵)은 review_runner의 reviewed-sha 마커가 처리하므로,
+    폴러는 "신규/변경 감지 → 호출"만 담당한다.
 
     트레이드오프: 봇 재시작 시 seen 캐시가 비어 그 사이 들어온 push는 baseline에 흡수돼
     한 번 놓칠 수 있다(수동 @멘션으로 커버). in-flight 가드로 멘션과의 중복은 막힌다.
@@ -384,13 +385,11 @@ def _poll_loop() -> None:
                 prev = seen.get(iid)
                 seen[iid] = sha
                 if first or prev == sha:
-                    continue  # baseline이거나 변경 없음
-                logger.info(
-                    "폴링: MR !%s SHA 변경 (%s→%s) → 리뷰 트리거",
-                    iid,
-                    prev[:8],
-                    sha[:8],
-                )
+                    continue  # baseline(기동 시 기존 MR)이거나 변경 없음
+                # prev is None → 기동 후 새로 열린 MR(open 자동 리뷰)
+                # prev != sha  → 기존 MR에 새 push(증분)
+                change = f"{prev[:8]}→{sha[:8]}" if prev else f"신규 open {sha[:8]}"
+                logger.info("폴링: MR !%s %s → 리뷰 트리거", iid, change)
                 _dispatch_review(pid, iid, web_url)
             first = False
         except Exception:
