@@ -68,7 +68,9 @@ PRIVATE_TOKEN = _required_env("GITLAB_TOKEN")
 
 # 리뷰 실패 시 알림 코멘트에서 @멘션할 대상.
 # webhook_server와 동일 컨테이너 env를 공유하므로 그대로 읽으면 된다.
-REVIEWER_USERNAME = os.environ.get("REVIEWER_USERNAME", "max").strip().lstrip("@") or "max"
+REVIEWER_USERNAME = (
+    os.environ.get("REVIEWER_USERNAME", "max").strip().lstrip("@") or "max"
+)
 
 # 리뷰 완료/실패 시 DM할 리뷰어("나")의 Slack member ID(U…). 비어 있으면 리뷰어
 # DM은 생략된다(assignee DM은 이메일 매핑으로 별도 처리). best-effort 알림이라
@@ -79,13 +81,13 @@ REVIEWER_SLACK_ID = os.environ.get("REVIEWER_SLACK_ID", "").strip()
 MAX_DESCRIPTION_CHARS = 1000
 MAX_TITLE_CHARS = 200
 MAX_REVIEW_BODY_CHARS = 900_000  # GitLab note 한도 여유
-CLAUDE_TIMEOUT_SEC = 1200        # 큰 레포 + 큰 diff 분석 worst-case 대응 (20분)
+CLAUDE_TIMEOUT_SEC = 1200  # 큰 레포 + 큰 diff 분석 worst-case 대응 (20분)
 GIT_CLONE_TIMEOUT_SEC = 120
 GIT_FETCH_TIMEOUT_SEC = 60
-CLONE_DEPTH = 100                # 일반적인 MR 분기 폭 + shallow boundary 효과 여유
-DEEPEN_STEPS = (300, 1000)       # base 미도달 시 점진적으로 더 깊이 가져옴
-STDERR_TAIL_LINES = 20           # 실패 알림 코멘트에 포함할 stderr 마지막 줄 수
-MAX_DETAIL_CHARS = 4000          # 실패 알림 코멘트 stderr 블록의 전체 문자 상한
+CLONE_DEPTH = 100  # 일반적인 MR 분기 폭 + shallow boundary 효과 여유
+DEEPEN_STEPS = (300, 1000)  # base 미도달 시 점진적으로 더 깊이 가져옴
+STDERR_TAIL_LINES = 20  # 실패 알림 코멘트에 포함할 stderr 마지막 줄 수
+MAX_DETAIL_CHARS = 4000  # 실패 알림 코멘트 stderr 블록의 전체 문자 상한
 
 # 백오프 재시도
 RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
@@ -128,9 +130,9 @@ REVIEW_MARKER_PREFIX = "<!-- ai-auto-review reviewed-sha:"
 _MARKER_RE = re.compile(r"<!--\s*ai-auto-review reviewed-sha:\s*([0-9a-f]{40})\s*-->")
 _OLDREV_RE = re.compile(r"[0-9a-f]{40}")
 
-MAX_DISCUSSION_PAGES = 5         # discussions 페이지네이션 상한 (per_page=100 → 500개)
-MAX_PRIOR_REVIEW_CHARS = 6000    # 프롬프트에 넣을 직전 AI 리뷰 본문 상한
-MAX_PRIOR_COMMENT_CHARS = 1000   # 사용자 코멘트 1건 본문 상한
+MAX_DISCUSSION_PAGES = 5  # discussions 페이지네이션 상한 (per_page=100 → 500개)
+MAX_PRIOR_REVIEW_CHARS = 6000  # 프롬프트에 넣을 직전 AI 리뷰 본문 상한
+MAX_PRIOR_COMMENT_CHARS = 1000  # 사용자 코멘트 1건 본문 상한
 MAX_PRIOR_COMMENTS_TOTAL = 8000  # 사용자 코멘트 전체 합산 상한
 
 
@@ -201,7 +203,9 @@ def _http_get(client: httpx.Client, url: str, *, headers: dict) -> httpx.Respons
             if resp.status_code in RETRY_STATUSES and attempt < RETRY_ATTEMPTS:
                 logger.warning(
                     "GitLab GET %s — backoff %.1fs (attempt %d)",
-                    resp.status_code, delay, attempt + 1,
+                    resp.status_code,
+                    delay,
+                    attempt + 1,
                 )
             else:
                 resp.raise_for_status()
@@ -242,7 +246,9 @@ def _http_post_json(
             if resp.status_code in RETRY_STATUSES and attempt < RETRY_ATTEMPTS:
                 logger.warning(
                     "GitLab POST %s — backoff %.1fs (attempt %d)",
-                    resp.status_code, delay, attempt + 1,
+                    resp.status_code,
+                    delay,
+                    attempt + 1,
                 )
             else:
                 resp.raise_for_status()
@@ -365,12 +371,16 @@ def fetch_discussions(project_id: int, mr_iid: int) -> list[dict]:
         total_pages_raw = first.headers.get("X-Total-Pages")
         if not total_pages_raw:
             # 헤더 부재 — 순방향 수집 폴백 (100개 미만 배치에서 종료, cap 적용).
-            logger.warning("discussions 응답에 X-Total-Pages 없음 — 순방향 수집으로 폴백")
+            logger.warning(
+                "discussions 응답에 X-Total-Pages 없음 — 순방향 수집으로 폴백"
+            )
             discussions.extend(first_batch)
             if len(first_batch) == 100:
                 for page in range(2, MAX_DISCUSSION_PAGES + 1):
                     batch = _parse_discussions_batch(
-                        _http_get_json(client, f"{page_url}&page={page}", headers=headers)
+                        _http_get_json(
+                            client, f"{page_url}&page={page}", headers=headers
+                        )
                     )
                     discussions.extend(batch)
                     if len(batch) < 100:
@@ -385,7 +395,9 @@ def fetch_discussions(project_id: int, mr_iid: int) -> list[dict]:
         if total_pages > MAX_DISCUSSION_PAGES:
             logger.warning(
                 "discussions %d페이지 — cap(%d) 초과, 최신 %d페이지만 수집",
-                total_pages, MAX_DISCUSSION_PAGES, MAX_DISCUSSION_PAGES,
+                total_pages,
+                MAX_DISCUSSION_PAGES,
+                MAX_DISCUSSION_PAGES,
             )
             start_page = total_pages - MAX_DISCUSSION_PAGES + 1  # page 1은 버림
         else:
@@ -455,8 +467,7 @@ def _strip_marker(body: str) -> str:
 def _is_resolved_discussion(d: dict) -> bool:
     """스레드의 resolvable 노트가 전부 resolved면 True (해결된 스레드)."""
     resolvable = [
-        n for n in d.get("notes", [])
-        if isinstance(n, dict) and n.get("resolvable")
+        n for n in d.get("notes", []) if isinstance(n, dict) and n.get("resolvable")
     ]
     return bool(resolvable) and all(n.get("resolved") for n in resolvable)
 
@@ -574,7 +585,9 @@ def _build_repo_url(project_path: str) -> str:
     return f"{_parsed.scheme}://oauth2@{_parsed.netloc}/{project_path}.git"
 
 
-def _run(cmd: list[str], *, timeout: int, cwd: str | None = None, env: dict | None = None) -> None:
+def _run(
+    cmd: list[str], *, timeout: int, cwd: str | None = None, env: dict | None = None
+) -> None:
     """git 명령 실행 helper.
 
     stdout은 버리고 stderr는 PIPE로 캡처한다. 성공 시 stderr는 버리고(진행
@@ -598,9 +611,7 @@ def _run(cmd: list[str], *, timeout: int, cwd: str | None = None, env: dict | No
         partial = e.stderr if isinstance(e.stderr, str) else ""
         if partial.strip():
             logger.warning("git stderr (timeout):\n%s", partial.strip())
-        raise RuntimeError(
-            f"명령 타임아웃 ({timeout}s): {' '.join(cmd[:3])}"
-        ) from e
+        raise RuntimeError(f"명령 타임아웃 ({timeout}s): {' '.join(cmd[:3])}") from e
 
     if result.returncode != 0:
         stderr_text = (result.stderr or "").strip()
@@ -623,17 +634,26 @@ def _ensure_base_reachable(
 
     반환: True = `...` 사용 가능, False = `..`로만 비교 가능.
     """
+
     def _has_base() -> bool:
         proc = subprocess.run(
             ["git", "-C", workdir, "merge-base", "HEAD", f"origin/{target_branch}"],
-            capture_output=True, text=True, timeout=10, env=git_env, check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env=git_env,
+            check=False,
         )
         return proc.returncode == 0
 
     def _is_shallow() -> bool:
         proc = subprocess.run(
             ["git", "-C", workdir, "rev-parse", "--is-shallow-repository"],
-            capture_output=True, text=True, timeout=10, env=git_env, check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env=git_env,
+            check=False,
         )
         return proc.stdout.strip() == "true"
 
@@ -642,16 +662,23 @@ def _ensure_base_reachable(
 
     if _is_shallow():
         for deepen in DEEPEN_STEPS:
-            logger.warning("shallow base 미도달 — --deepen=%d 시도 (source+target)", deepen)
+            logger.warning(
+                "shallow base 미도달 — --deepen=%d 시도 (source+target)", deepen
+            )
             try:
                 # source/target 양쪽 모두 deepen해야 merge-base 도달 가능.
                 # 한 쪽만 deepen하면 다른 쪽이 얕은 채로 남아 base 못 닿음.
                 for branch in (source_branch, target_branch):
                     _run(
                         [
-                            "git", "-C", workdir,
-                            "-c", f"credential.helper={GIT_CREDENTIAL_HELPER}",
-                            "fetch", f"--deepen={deepen}", "origin",
+                            "git",
+                            "-C",
+                            workdir,
+                            "-c",
+                            f"credential.helper={GIT_CREDENTIAL_HELPER}",
+                            "fetch",
+                            f"--deepen={deepen}",
+                            "origin",
                             f"+refs/heads/{branch}:refs/remotes/origin/{branch}",
                         ],
                         timeout=GIT_FETCH_TIMEOUT_SEC * 2,
@@ -669,9 +696,14 @@ def _ensure_base_reachable(
             try:
                 _run(
                     [
-                        "git", "-C", workdir,
-                        "-c", f"credential.helper={GIT_CREDENTIAL_HELPER}",
-                        "fetch", "--unshallow", "origin",
+                        "git",
+                        "-C",
+                        workdir,
+                        "-c",
+                        f"credential.helper={GIT_CREDENTIAL_HELPER}",
+                        "fetch",
+                        "--unshallow",
+                        "origin",
                     ],
                     timeout=GIT_CLONE_TIMEOUT_SEC,
                     env=git_env,
@@ -708,10 +740,13 @@ def cloned_repo(
         _run(
             [
                 "git",
-                "-c", f"credential.helper={GIT_CREDENTIAL_HELPER}",
+                "-c",
+                f"credential.helper={GIT_CREDENTIAL_HELPER}",
                 "clone",
-                "--depth", str(CLONE_DEPTH),
-                "--branch", source_branch,
+                "--depth",
+                str(CLONE_DEPTH),
+                "--branch",
+                source_branch,
                 "--no-single-branch",
                 repo_url,
                 workdir,
@@ -722,10 +757,14 @@ def cloned_repo(
         # target branch fetch — 명시 refspec으로 refs/remotes/origin/<target> 생성 강제
         _run(
             [
-                "git", "-C", workdir,
-                "-c", f"credential.helper={GIT_CREDENTIAL_HELPER}",
+                "git",
+                "-C",
+                workdir,
+                "-c",
+                f"credential.helper={GIT_CREDENTIAL_HELPER}",
                 "fetch",
-                "--depth", str(CLONE_DEPTH),
+                "--depth",
+                str(CLONE_DEPTH),
                 "origin",
                 f"+refs/heads/{target_branch}:refs/remotes/origin/{target_branch}",
             ],
@@ -737,7 +776,9 @@ def cloned_repo(
         # revision 에러를 낸다. 미리 merge-base를 시도하고 실패하면 source/target 양쪽을
         # 점진적으로 --deepen 한다. disjoint history (공통 조상 없음) 인 경우 False —
         # Claude prompt를 `..`로 fallback.
-        base_reachable = _ensure_base_reachable(workdir, source_branch, target_branch, git_env)
+        base_reachable = _ensure_base_reachable(
+            workdir, source_branch, target_branch, git_env
+        )
 
         logger.info("clone 완료 (base_reachable=%s)", base_reachable)
         yield workdir, base_reachable
@@ -751,7 +792,10 @@ def _sha_reachable(workdir: str, sha: str) -> bool:
     try:
         proc = subprocess.run(
             ["git", "-C", workdir, "cat-file", "-e", f"{sha}^{{commit}}"],
-            capture_output=True, text=True, timeout=10, check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
         )
     except (OSError, subprocess.SubprocessError):
         return False
@@ -762,7 +806,10 @@ def _git_head_sha(workdir: str) -> str:
     """클론된 source 브랜치의 현재 HEAD SHA — 리뷰 코멘트 마커에 심을 값 (Q1)."""
     proc = subprocess.run(
         ["git", "-C", workdir, "rev-parse", "HEAD"],
-        capture_output=True, text=True, timeout=10, check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
     )
     if proc.returncode != 0:
         raise RuntimeError(f"HEAD SHA 확인 실패 (rc={proc.returncode})")
@@ -774,7 +821,10 @@ def _count_new_commits(workdir: str, sha: str) -> int:
     try:
         proc = subprocess.run(
             ["git", "-C", workdir, "rev-list", "--count", f"{sha}..HEAD"],
-            capture_output=True, text=True, timeout=10, check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
         )
     except (OSError, subprocess.SubprocessError):
         return -1
@@ -915,22 +965,28 @@ def run_claude_review(
     # 실행이 가능하다 — env에 토큰이 남아 있으면 그대로 유출된다. 따라서 Slack 봇/앱
     # 토큰도 반드시 함께 벗긴다. (호스트 ~/.claude 세션 토큰은 마운트라 env 밖 — 별도 위험.)
     claude_env = {
-        k: v for k, v in os.environ.items()
-        if k not in {"GITLAB_TOKEN", "WEBHOOK_SECRET", "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN"}
+        k: v
+        for k, v in os.environ.items()
+        if k
+        not in {"GITLAB_TOKEN", "WEBHOOK_SECRET", "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN"}
     }
 
     # stdout/stderr 모두 PIPE로 캡처 — stderr는 실패 알림 코멘트의 재료가 되고,
     # 캡처 후 logger로 재출력해 docker logs 가시성도 유지한다.
     logger.info(
         "claude 호출 시작 (timeout=%ds, allowed-tools=%s)",
-        CLAUDE_TIMEOUT_SEC, ALLOWED_TOOLS,
+        CLAUDE_TIMEOUT_SEC,
+        ALLOWED_TOOLS,
     )
     try:
         result = subprocess.run(
             [
-                "claude", "-p",
-                "--allowed-tools", ALLOWED_TOOLS,
-                "--add-dir", workdir,
+                "claude",
+                "-p",
+                "--allowed-tools",
+                ALLOWED_TOOLS,
+                "--add-dir",
+                workdir,
             ],
             input=prompt,
             stdout=subprocess.PIPE,
@@ -1005,9 +1061,7 @@ def build_review_comment(review: str, head_sha: str) -> str:
     return _truncate(review, budget) + marker
 
 
-def post_comment(
-    project_id: int, mr_iid: int, review: str, head_sha: str = ""
-) -> None:
+def post_comment(project_id: int, mr_iid: int, review: str, head_sha: str = "") -> None:
     _post_note(project_id, mr_iid, build_review_comment(review, head_sha))
 
 
@@ -1106,13 +1160,25 @@ def main(project_id: int, mr_iid: int, oldrev: str | None = None) -> int:
     try:
         mr = get_mr_metadata(project_id, mr_iid)
     except Exception as e:
-        logger.exception("MR 메타데이터 조회 실패 (project=%s mr=%s)", project_id, mr_iid)
+        logger.exception(
+            "MR 메타데이터 조회 실패 (project=%s mr=%s)", project_id, mr_iid
+        )
         notify_failure(
-            project_id, mr_iid, "MR 메타데이터 조회",
+            project_id,
+            mr_iid,
+            "MR 메타데이터 조회",
             "GitLab API 응답 오류 — 토큰 권한 또는 MR 접근 가능 여부를 확인하세요.",
             str(e),
         )
         return 1
+
+    # 닫히거나 병합된 MR은 리뷰 대상이 아니다 — GitLab Slack notification은 MR
+    # close/merge에도 채널 알림을 보내므로 봇 message 트리거가 닫힌 MR을 부를 수 있고,
+    # 브랜치가 이미 삭제됐으면 clone도 실패한다. 실패가 아니므로 알림 없이 스킵.
+    state = mr.get("state")
+    if state != "opened":
+        logger.info("skip: MR state=%s — 열린 MR만 리뷰", state)
+        return 0
 
     # Fork MR 차단 — 초기 스코프 외 (실패가 아니므로 알림 없음)
     src_pid = mr.get("source_project_id")
@@ -1128,7 +1194,9 @@ def main(project_id: int, mr_iid: int, oldrev: str | None = None) -> int:
     if not source_branch or not target_branch:
         logger.error("source/target branch 누락 (project=%s mr=%s)", project_id, mr_iid)
         notify_failure(
-            project_id, mr_iid, "MR 메타데이터 조회",
+            project_id,
+            mr_iid,
+            "MR 메타데이터 조회",
             "MR 응답에 source/target branch가 없음 — MR 상태를 확인하세요.",
         )
         return 1
@@ -1142,7 +1210,9 @@ def main(project_id: int, mr_iid: int, oldrev: str | None = None) -> int:
     except Exception as e:
         logger.exception("project path 조회 실패 (project=%s)", project_id)
         notify_failure(
-            project_id, mr_iid, "프로젝트 경로 조회",
+            project_id,
+            mr_iid,
+            "프로젝트 경로 조회",
             "GitLab API 응답 오류 — 토큰 권한을 확인하세요.",
             str(e),
         )
@@ -1157,8 +1227,8 @@ def main(project_id: int, mr_iid: int, oldrev: str | None = None) -> int:
 
     # M1 — AI 리뷰 author 대조용. discussions가 비면 어차피 무의미하므로 호출 생략.
     bot_username = get_token_username() if discussions else None
-    reviewed_sha = (
-        extract_reviewed_sha(discussions, bot_username) or _normalize_oldrev(oldrev)
+    reviewed_sha = extract_reviewed_sha(discussions, bot_username) or _normalize_oldrev(
+        oldrev
     )
     prior_review, user_comments = collect_prior_comments(discussions, bot_username)
     logger.info(
@@ -1170,7 +1240,10 @@ def main(project_id: int, mr_iid: int, oldrev: str | None = None) -> int:
     )
 
     try:
-        with cloned_repo(project_path, source_branch, target_branch) as (workdir, base_reachable):
+        with cloned_repo(project_path, source_branch, target_branch) as (
+            workdir,
+            base_reachable,
+        ):
             head_sha = ""
             try:
                 head_sha = _git_head_sha(workdir)
@@ -1193,7 +1266,9 @@ def main(project_id: int, mr_iid: int, oldrev: str | None = None) -> int:
             except ReviewError as e:
                 logger.error(
                     "Claude 리뷰 생성 실패 (project=%s mr=%s): %s",
-                    project_id, mr_iid, e,
+                    project_id,
+                    mr_iid,
+                    e,
                 )
                 notify_failure(project_id, mr_iid, e.stage, e.reason, e.detail)
                 return 1
@@ -1202,7 +1277,9 @@ def main(project_id: int, mr_iid: int, oldrev: str | None = None) -> int:
                     "Claude 리뷰 생성 실패 (project=%s mr=%s)", project_id, mr_iid
                 )
                 notify_failure(
-                    project_id, mr_iid, "claude 실행",
+                    project_id,
+                    mr_iid,
+                    "claude 실행",
                     "예기치 못한 오류로 리뷰 생성에 실패했습니다.",
                     str(e),
                 )
@@ -1222,11 +1299,11 @@ def main(project_id: int, mr_iid: int, oldrev: str | None = None) -> int:
             # MR 코멘트 게시 성공 후에만 완료 DM — best-effort, 실패해도 무시.
             notify_slack_success(mr, project_id, mr_iid)
     except Exception as e:
-        logger.exception(
-            "repo clone/fetch 실패 (project=%s mr=%s)", project_id, mr_iid
-        )
+        logger.exception("repo clone/fetch 실패 (project=%s mr=%s)", project_id, mr_iid)
         notify_failure(
-            project_id, mr_iid, "저장소 clone/fetch",
+            project_id,
+            mr_iid,
+            "저장소 clone/fetch",
             "GITLAB_TOKEN 권한/만료 또는 네트워크 문제 가능성.",
             str(e),
         )

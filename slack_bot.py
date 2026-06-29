@@ -128,6 +128,28 @@ def _parse_mention(text: str) -> tuple[int, int, str] | None:
     return project_id, mr_iid, web_url
 
 
+def _mr_is_opened(project_id: int, mr_iid: int) -> bool:
+    """MR이 열린 상태인지. 조회 실패 시 True(보수적 진행 — review_runner가 최종 방어).
+
+    GitLab Slack notification은 MR close/merge에도 채널 알림을 보내므로, 자동
+    트리거(message)가 닫히거나 병합된 MR을 리뷰하지 않도록 state를 확인한다.
+    """
+    try:
+        resp = httpx.get(
+            f"{GITLAB_URL}/api/v4/projects/{project_id}/merge_requests/{mr_iid}",
+            headers={"PRIVATE-TOKEN": GITLAB_TOKEN},
+            timeout=30.0,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:
+        logger.exception(
+            "MR state 조회 실패 (project=%s mr=%s) — 트리거 진행", project_id, mr_iid
+        )
+        return True
+    return isinstance(data, dict) and data.get("state") == "opened"
+
+
 def _post(channel: str | None, thread_ts: str | None, text: str) -> None:
     """스레드 답글 게시 (best-effort). channel이 없으면(폴링 트리거 등) no-op."""
     if not channel:
@@ -302,6 +324,10 @@ def handle_channel_message(event: dict, say) -> None:
         return  # MR 링크 없는 메시지 — 조용히 무시
 
     project_id, mr_iid, web_url = parsed
+    # GitLab은 MR close/merge에도 채널 알림을 보낸다 — 자동 트리거는 열린 MR만 리뷰한다.
+    if not _mr_is_opened(project_id, mr_iid):
+        logger.info("skip: 채널 트리거 — MR !%s가 열린 상태가 아님", mr_iid)
+        return
     channel = event.get("channel", "")
     thread_ts = event.get("thread_ts") or event.get("ts")
     _dispatch_review(project_id, mr_iid, web_url, channel, thread_ts, say)
