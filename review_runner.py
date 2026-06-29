@@ -111,7 +111,7 @@ RETRY_ATTEMPTS = 2
 #   벗기는 건 GITLAB_TOKEN/WEBHOOK_SECRET뿐, 호스트 세션 토큰은 보호 밖이다.
 # - 운영 복귀 시 "Read,Glob,Grep,Bash(git:*)"로 되돌리거나, ~/.claude 마운트 노출을
 #   먼저 축소할 것.
-ALLOWED_TOOLS = "Read,Glob,Grep,Bash,Task"
+ALLOWED_TOOLS = "Read,Glob,Grep,Bash(git:*),Task"
 
 # git credential helper — PAT를 env var(GITLAB_TOKEN)로 전달 (ps 노출 회피)
 GIT_CREDENTIAL_HELPER = (
@@ -961,9 +961,11 @@ def run_claude_review(
     # claude 서브프로세스에서 자격증명 env를 제거한다.
     # clone/fetch는 이 함수 호출 전에 이미 끝났고, claude는 클론된 로컬 레포에서
     # git diff/log/show만 돌리므로 GITLAB_TOKEN·WEBHOOK_SECRET·SLACK_* 모두 불필요하다.
-    # 현재 ALLOWED_TOOLS가 full Bash를 허용(실험)하므로 prompt injection 시 임의 shell
-    # 실행이 가능하다 — env에 토큰이 남아 있으면 그대로 유출된다. 따라서 Slack 봇/앱
-    # 토큰도 반드시 함께 벗긴다. (호스트 ~/.claude 세션 토큰은 마운트라 env 밖 — 별도 위험.)
+    # ALLOWED_TOOLS는 메인을 Bash(git:*)로 좁히고, /review-pr 서브에이전트들도 호스트
+    # ~/.claude/agents/에서 Bash(git:*)로 좁혀(부모 --allowed-tools는 서브에 전파 안 됨 —
+    # 서브에이전트 정의 자체를 좁혀야 한다) 임의 shell 실행 경로를 줄였다. 그래도 best-effort
+    # 방어로 토큰은 strip한다 — 단 CLAUDE_CODE_OAUTH_TOKEN은 claude 인증에 필요해 strip
+    # 못 하므로(env에 남음), Bash 스코핑이 그 토큰을 지키는 1차 방어가 된다.
     claude_env = {
         k: v
         for k, v in os.environ.items()
