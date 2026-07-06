@@ -168,6 +168,36 @@ MR이 열릴 때마다 자동으로 리뷰가 돌게 하려면, GitLab이 MR 링
 - 트레이드오프: push 후 최대 한 폴링 간격(기본 5분)만큼 지연된다. 봇 재시작 직후의 push는
   baseline에 흡수돼 한 번 놓칠 수 있다(그땐 수동 `@멘션`으로 처리).
 
+## 8. (부가 기능) /project-status — Notion 태스크 현황
+
+MR 리뷰와 별개로, Notion Tasks DB의 현황(지연/차단/진행중/대기/완료)을 슬래시
+커맨드로 조회한다. Socket Mode라 **Request URL 없이** 등록만 하면 된다.
+
+1. **Slack 앱에 커맨드 등록**: [api.slack.com/apps](https://api.slack.com/apps) →
+   해당 앱 → **Slash Commands → Create New Command**
+   - Command: `/project-status`
+   - Short Description: `Notion 태스크 현황 조회`
+   - Usage Hint: `[지연|차단|진행|대기|완료|담당자이름] [public]`
+   - Socket Mode가 켜져 있으면 Request URL은 입력하지 않는다.
+2. 앱 **재설치**(Reinstall to Workspace) — `commands` 스코프가 자동 추가된다.
+3. **Notion 통합 발급**: [notion.so/my-integrations](https://www.notion.so/my-integrations)에서
+   internal integration 생성 → secret을 `.env`의 `NOTION_TOKEN`에.
+   capability에 **사용자 정보 읽기**를 켜야 Assignee 이름이 나온다.
+4. **DB에 통합 연결**: 대상 Tasks DB 우상단 `⋯` → 연결 → 통합 선택.
+   DB가 다르면 `.env`의 `NOTION_TASKS_DB_ID`를 바꾼다.
+
+사용:
+
+```
+/project-status              # 전체 요약 (나에게만 보임)
+/project-status 지연          # 지연 태스크만
+/project-status kkalla       # 담당자 이름 부분일치
+/project-status public       # 채널 전체 공개로 게시
+```
+
+`NOTION_TOKEN`이 비어 있으면 커맨드는 안내 문구만 답하고, 봇의 다른 기능(리뷰
+트리거)엔 영향이 없다.
+
 ## assignee DM이 안 오는 경우
 
 assignee Slack 매핑은 **GitLab 이메일 → Slack `users.lookupByEmail`**로 동작한다.

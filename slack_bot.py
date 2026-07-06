@@ -12,6 +12,9 @@ WebSocket을 직접 연다(방화벽/NAT 무관).
                                  봇이 직접 리뷰어 지정 열린 MR의 source SHA를 주기적으로
                                  확인해 변경분(새 push)을 리뷰한다
 
+부가 기능(리뷰와 무관): /project-status 슬래시 커맨드 — Notion Tasks DB 현황
+조회(notion_status.py). NOTION_TOKEN 미설정이면 안내만 답한다.
+
 공통 흐름:
       → URL/목록에서 project_id/mr_iid 해석
       → review_runner.py 서브프로세스 실행 (증분 리뷰는 review_runner가 MR
@@ -38,6 +41,7 @@ import httpx
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
+import notion_status
 import slack_notifier
 
 _LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
@@ -331,6 +335,35 @@ def handle_channel_message(event: dict, say) -> None:
     channel = event.get("channel", "")
     thread_ts = event.get("thread_ts") or event.get("ts")
     _dispatch_review(project_id, mr_iid, web_url, channel, thread_ts, say)
+
+
+@app.command("/project-status")
+def handle_project_status(ack, respond, command) -> None:
+    """/project-status [키워드|담당자] [public] — Notion Tasks DB 현황 리포트.
+
+    MR 리뷰와 무관한 부가 기능. Socket Mode라 슬래시 커맨드도 같은 WebSocket으로
+    들어온다(Request URL 불필요). Notion 조회(페이지네이션 + 프로젝트 제목 해석)가
+    Slack의 3초 ack 제한을 넘길 수 있어, ack만 즉시 하고 조회는 별도 스레드에서
+    respond(response_url)로 답한다. 기본 ephemeral, `public` 인자면 채널 공개.
+    """
+    if not notion_status.enabled():
+        ack("NOTION_TOKEN이 설정되지 않아 현황 조회를 사용할 수 없어요.")
+        return
+    words = (command.get("text") or "").split()
+    public = "public" in words
+    query = " ".join(w for w in words if w != "public")
+    ack("📊 Notion에서 태스크 현황 조회 중…")
+
+    def _run() -> None:
+        try:
+            report = notion_status.build_report(query)
+        except Exception:
+            logger.exception("/project-status 조회 실패")
+            respond(text="⚠️ Notion 조회 중 오류가 발생했어요. 봇 로그를 확인해 주세요.")
+            return
+        respond(text=report, response_type="in_channel" if public else "ephemeral")
+
+    threading.Thread(target=_run, daemon=True).start()
 
 
 def _fetch_open_reviewer_mrs() -> list[dict]:

@@ -87,7 +87,18 @@ Review is **clone-based**: `review_runner.py` shallow-clones the repo into a tem
 - 세 트리거는 `_dispatch_review()`를 공유하고 `(project_id, mr_iid)` in-flight 가드로 중복을 막는다 — 멘션 메시지는 `app_mention`·`message` 둘 다 발생하지만 먼저 잡은 쪽만 실행된다. 봇 자신의 답글이 `message`로 되돌아와 재트리거되는 것은 Bolt 기본 `ignoring_self_events`가 막는다.
 - **폴러**(`_poll_loop`, 데몬 스레드)는 첫 순회를 **baseline**으로 잡고(봇 기동 시 기존 MR 일괄 리뷰 방지) 이후 source SHA가 바뀐 MR만 트리거한다. 폴링 트리거는 `channel`/`say` 없이 `_dispatch_review`를 호출해 **스레드 답글 없이 조용히** 돌고(결과는 review_runner의 MR 코멘트 + DM), `_post`는 `channel`이 없으면 no-op이다. `POLL_INTERVAL_SEC=0`이면 폴러 비활성화. 봇 재시작 시 baseline이 비어 그 사이 push는 한 번 놓칠 수 있다(수동 멘션으로 커버).
 - 봇은 oldrev를 넘기지 않는다 — 증분 리뷰는 review_runner가 MR 코멘트의 `reviewed-sha` 마커로 자체 처리하므로 `@멘션` 수동 트리거에서도 정상 동작한다.
-- `slack_bot.py`만 `slack_bolt`에 의존한다. `review_runner.py`/`slack_notifier.py`는 `httpx`만 쓴다 — review_runner의 테스트 의존성을 가볍게 유지하기 위함(테스트는 `slack_bolt` 미설치로도 통과).
+- `slack_bot.py`만 `slack_bolt`에 의존한다. `review_runner.py`/`slack_notifier.py`/`notion_status.py`는 `httpx`만 쓴다 — review_runner의 테스트 의존성을 가볍게 유지하기 위함(테스트는 `slack_bolt` 미설치로도 통과).
+
+### Notion 태스크 현황 (`notion_status.py`, /project-status)
+
+MR 리뷰와 무관한 Slack 봇 부가 기능. `/project-status [지연|차단|진행|대기|완료|담당자이름] [public]` 슬래시 커맨드가 Notion Tasks DB(`NOTION_TASKS_DB_ID`, 기본 제1연구센터 Tasks)를 REST API로 전체 페이지네이션 조회한 뒤 **로컬에서 분류**해 mrkdwn 리포트로 답한다. Socket Mode라 커맨드도 WebSocket으로 들어온다(Request URL 불필요) — 핸들러는 `ack()`만 즉시 하고(3초 제한) 조회는 별도 스레드에서 `respond()`로 답한다. 기본 ephemeral, `public` 인자면 채널 공개.
+
+- 분류 우선순위: Done/Drop → 지연(`Delayed` 상태 또는 계획 일정 경과) → 차단(미완료 `Blocked by` 존재) → 진행중 → 대기. blocker 상태 해석을 위해 Done 포함 전체를 가져온다. 조회 결과에 없는 blocker는 미완료로 간주(보수적).
+- 프로젝트 이름은 `Project` relation의 페이지 제목을 표시 시점에 개별 GET(실행 1회 dict 캐시). 실패는 빈 문자열로 강등.
+- Notion API 버전은 `2022-06-28` 고정 — `databases/{id}/query`가 기본 data source를 직접 질의한다(2025-09 버전의 data_source id 단계 회피).
+- `NOTION_TOKEN` 미설정이면 `enabled()` False → 커맨드는 안내만 답하고 봇 부팅엔 영향 없음(slack_notifier와 같은 원칙). `NOTION_TOKEN`은 `_TOKEN` 접미사라 review_runner의 fail-secure denylist가 claude env에서 자동으로 가린다.
+- 테스트는 `tests/test_notion_status.py` — 순수 함수(parse/classify/filter/format)만.
+- Slack 앱에 Slash Command 등록 + Notion 통합의 DB 연결 필요 — `SLACK_SETUP.md` §8.
 
 ### Slack 알림 (`slack_notifier.py`)
 
@@ -176,6 +187,8 @@ Slack 봇 모드 (`slack_bot.py`):
 - `SLACK_APP_TOKEN` (`xapp-…`) — App-Level 토큰, `connections:write`. Socket Mode 전용. 봇 부팅 필수.
 - `REVIEWER_SLACK_ID` (`U…`) — 완료/실패 DM을 받을 리뷰어 member ID. 선택 — 비면 리뷰어 DM 생략(assignee DM은 이메일 매핑으로 별도).
 - `POLL_INTERVAL_SEC` (default 300) — 폴러 주기(초). reviewer 지정 열린 MR의 source SHA를 이 주기로 확인해 push 증분을 자동 리뷰한다. `0`이면 폴러 비활성화(채널알림·멘션만). slack_bot 전용.
+- `NOTION_TOKEN` — Notion internal integration secret. 선택 — 비면 `/project-status`만 비활성(안내 답변). 대상 DB에 통합 연결 필요.
+- `NOTION_TASKS_DB_ID` (default 제1연구센터 Tasks) — `/project-status`가 조회할 Tasks DB ID.
 
 ## Conventions
 
