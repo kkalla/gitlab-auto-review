@@ -71,7 +71,7 @@ Review is **clone-based**: `review_runner.py` shallow-clones the repo into a tem
 `review_runner.py`는 두 트리거가 공유한다. **하나의 컨테이너 이미지, 두 진입점:**
 
 1. **`webhook_server.py`** (webhook 모드) — GitLab MR webhook을 공개 HTTP로 받음. `WEBHOOK_SECRET` 필요, `ports: 8080` 노출.
-2. **`slack_bot.py`** (Slack 봇 모드, **기본 CMD**) — Slack Socket Mode 봇. **공개 inbound 포트 불필요** — 봇이 Slack으로 아웃바운드 WebSocket을 연다(방화벽/NAT 무관). 트리거 **세 가지**: **자동·채널알림**(GitLab Slack notification이 뿌린 MR 링크를 `message` 이벤트로 잡음 — 주로 MR open) / **자동·폴링**(봇이 `POLL_INTERVAL_SEC`마다 reviewer 지정 열린 MR의 source SHA를 확인해 변경분을 리뷰 — **push 증분의 길**; GitLab Slack 알림은 MR push를 채널에 안 띄우므로 필요) / **수동·멘션**(`@mr-reviewer <MR URL>`). 설정은 `SLACK_SETUP.md`.
+2. **`slack_bot.py`** (Slack 봇 모드, **기본 CMD**) — Slack Socket Mode 봇. **공개 inbound 포트 불필요** — 봇이 Slack으로 아웃바운드 WebSocket을 연다(방화벽/NAT 무관). 트리거 **세 가지**: **자동·채널알림**(GitLab Slack notification이 뿌린 MR 링크를 `message` 이벤트로 잡음 — 주로 MR open) / **자동·폴링**(봇이 `POLL_INTERVAL_SEC`마다 reviewer 지정 열린 MR의 source SHA를 확인해 변경분을 리뷰 — **push 증분의 길**; GitLab Slack 알림은 MR push를 채널에 안 띄우므로 필요) / **수동·멘션**(`@ags-watchtower <MR URL>`). 설정은 `SLACK_SETUP.md`.
 
 ```
 (자동·채널) GitLab 알림 → 채널 message → slack_bot.py (handle_channel_message)

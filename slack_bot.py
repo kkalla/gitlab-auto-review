@@ -298,7 +298,7 @@ def handle_mention(event: dict, say) -> None:
             thread_ts=thread_ts,
             text=(
                 "리뷰할 MR을 못 찾았어요. GitLab Merge Request URL을 함께 멘션해 주세요.\n"
-                "예: `@mr-reviewer https://git.example.com/group/repo/-/merge_requests/123`"
+                "예: `@ags-watchtower https://git.example.com/group/repo/-/merge_requests/123`"
             ),
         )
         return
