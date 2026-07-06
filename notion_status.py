@@ -520,25 +520,54 @@ def _format_grouped_item(
 
 
 def group_by(
-    buckets: dict[str, list[dict]], group: str, project_title: Callable[[str], str]
+    buckets: dict[str, list[dict]],
+    group: str,
+    project_title: Callable[[str], str],
+    project_status: Callable[[str], str] | None = None,
 ) -> list[tuple[str, list[tuple[str, dict]]]]:
     """done 제외 태스크를 프로젝트/담당자별로 묶는다 — /task-status 그룹 뷰.
 
     urgency 순서(지연→차단→진행중→대기)로 순회하므로 그룹 안 정렬이 유지된다.
     다중 값(프로젝트·담당자 여럿)이면 각 그룹에 중복으로 넣고, 값이 없으면
-    '(프로젝트 없음)'/'(담당자 없음)' 그룹에 담는다. 그룹은 태스크 수 내림차순
-    (동수면 이름순) — 큰 덩어리를 위로. 반환은 (그룹명, [(버킷 키, 태스크)…]) 목록.
+    '(프로젝트 없음)'/'(담당자 없음)' 그룹에 담는다.
+
+    그룹 정렬: 프로젝트 그룹은 project_status가 주어지면 상태 순(진행중 → 예정 →
+    종료)을 1차 키로, 그 안에서 태스크 수 desc·이름 asc. 담당자 그룹(또는 status
+    없음)은 태스크 수 desc·이름 asc. '(없음)' 그룹은 항상 맨 뒤.
+    반환은 (그룹명, [(버킷 키, 태스크)…]) 목록.
     """
     none_label = "(프로젝트 없음)" if group == "project" else "(담당자 없음)"
     groups: dict[str, list[tuple[str, dict]]] = {}
+    status_of: dict[str, str] = {}  # 그룹명 → 프로젝트 상태 (project 정렬용)
     for key in _BUCKET_EMOJI:
         for t in buckets[key]:
             if group == "project":
-                names = [n for n in map(project_title, t["project_ids"]) if n]
+                labels = []
+                for pid in t["project_ids"]:
+                    name = project_title(pid)
+                    if name:
+                        labels.append(name)
+                        if project_status is not None:
+                            status_of.setdefault(name, project_status(pid))
             else:
-                names = list(t["assignees"])
-            for name in names or [none_label]:
+                labels = list(t["assignees"])
+            for name in labels or [none_label]:
                 groups.setdefault(name, []).append((key, t))
+
+    if group == "project" and project_status is not None:
+        # 진행중 → 예정 → 종료 순(_project_group 재사용), 그 안은 수 desc·이름 asc.
+        rank = {"in_progress": 0, "todo": 1, "done": 2}
+
+        def sort_key(kv: tuple[str, list]) -> tuple:
+            name = kv[0]
+            r = (
+                3
+                if name == none_label
+                else rank[_project_group(status_of.get(name, ""))]
+            )
+            return (r, -len(kv[1]), name)
+
+        return sorted(groups.items(), key=sort_key)
     # 태스크 수 desc, 이름 asc. (없음) 그룹은 항상 맨 뒤로.
     return sorted(
         groups.items(),
@@ -552,8 +581,12 @@ def format_grouped_report(
     group: str,
     project_title: Callable[[str], str],
     note: str = "",
+    project_status: Callable[[str], str] | None = None,
 ) -> str:
-    """버킷 → 프로젝트/담당자별 그룹 뷰 리포트. 그룹당 MAX_ITEMS_PER_SECTION개 + '외 N건'."""
+    """버킷 → 프로젝트/담당자별 그룹 뷰 리포트. 그룹당 MAX_ITEMS_PER_SECTION개 + '외 N건'.
+
+    project_status가 주어지면 프로젝트 그룹을 상태 순(진행중 먼저)으로 정렬한다.
+    """
     counts = {k: len(v) for k, v in buckets.items()}
     total = sum(counts.values())
     axis = "프로젝트" if group == "project" else "담당자"
@@ -566,7 +599,7 @@ def format_grouped_report(
         f"전체 {total} · 지연 {counts['delayed']} · 차단 {counts['blocked']} · "
         f"진행중 {counts['in_progress']} · 대기 {counts['todo']} · 완료 {counts['done']}",
     ]
-    grouped = group_by(buckets, group, project_title)
+    grouped = group_by(buckets, group, project_title, project_status)
     for name, items in grouped:
         lines.append(f"\n*{icon} {name} ({len(items)})*")
         lines.extend(
@@ -683,9 +716,12 @@ def build_report(filter_text: str = "") -> str:
         logger.exception("Projects DB 벌크 조회 실패 — 프로젝트 메타 없이 진행")
         meta = project_meta_resolver({}, allow_fallback=False)
     project_title = lambda pid: meta(pid)["name"]  # noqa: E731
+    project_status = lambda pid: meta(pid)["status"]  # noqa: E731
     if group:
-        return format_grouped_report(buckets, today, group, project_title, note)
-    tiers = group_tiers(buckets, lambda pid: meta(pid)["status"])
+        return format_grouped_report(
+            buckets, today, group, project_title, note, project_status
+        )
+    tiers = group_tiers(buckets, project_status)
     return format_report(buckets, tiers, today, project_title, note, show_done)
 
 

@@ -527,6 +527,20 @@ def test_group_by_multi_value_duplicates_across_groups():
     assert {t["id"] for _, t in grouped["베타"]} == {"x"}
 
 
+def test_group_by_project_status_orders_in_progress_first():
+    # project_status 주면 진행중 프로젝트 그룹이 먼저 (수가 적어도)
+    tasks = [
+        _task(id="d1", project_ids=["done"]),
+        _task(id="d2", project_ids=["done"]),  # 종료 프로젝트 2건
+        _task(id="a1", project_ids=["live"]),  # 진행중 프로젝트 1건
+    ]
+    buckets = ns.classify(tasks, TODAY)
+    title = lambda pid: {"live": "진행중P", "done": "종료P"}[pid]  # noqa: E731
+    status = lambda pid: {"live": "In progress", "done": "Done"}[pid]  # noqa: E731
+    grouped = ns.group_by(buckets, "project", title, status)
+    assert [name for name, _ in grouped] == ["진행중P", "종료P"]  # 진행중 먼저
+
+
 def test_group_by_none_group_sorts_last():
     tasks = [
         _task(id="n"),  # 프로젝트 없음
