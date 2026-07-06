@@ -189,7 +189,8 @@ def test_group_tiers_active_project():
     # 티어①: 프로젝트가 In progress면 최상단
     tiers = _tiers([_task(project_ids=["p1"])], {"p1": "In progress"})
     assert [t["id"] for _, t in tiers["active"]] == ["t1"]
-    assert not tiers["integrity"] and not tiers["rest"]
+    assert not tiers["integrity"]
+    assert not tiers["no_project"] and not tiers["no_schedule"]
 
 
 def test_group_tiers_scheduled():
@@ -217,19 +218,23 @@ def test_group_tiers_done_task_excluded():
     assert not any(tiers.values())
 
 
-def test_group_tiers_rest():
-    # 티어④: 프로젝트 없음/미시작 + 스케줄 없음, 또는 미시작 아닌 태스크
+def test_group_tiers_no_project_vs_no_schedule():
+    # 기타를 둘로 분리: 프로젝트 relation 없음 → no_project, 있으면 → no_schedule
     tasks = [
-        _task(id="r1", status="Pending"),  # 프로젝트·스케줄 없음
+        _task(id="np1", status="Pending"),  # 프로젝트·스케줄 없음 → 미연결
         _task(
-            id="r2", status="Pending", project_ids=["p1"]
-        ),  # 미시작 프로젝트 + 스케줄 없음
+            id="np2", status="In progress", plan_start="2026-08-01"
+        ),  # 프로젝트 없음(일정 있어도 미연결이 우선)
         _task(
-            id="r3", status="In progress", plan_start="2026-08-01"
-        ),  # 미시작 아님 → ② 불가
+            id="ns1", status="Pending", project_ids=["p1"]
+        ),  # 미시작 프로젝트 + 스케줄 없음 → 일정 없음
+        _task(
+            id="ns2", status="In progress", plan_start="2026-08-01", project_ids=["p1"]
+        ),  # 프로젝트는 있으나 진행중/종료 아님, 미시작 아님 → 일정 없음
     ]
     tiers = _tiers(tasks, {"p1": "Pending"})
-    assert {t["id"] for _, t in tiers["rest"]} == {"r1", "r2", "r3"}
+    assert {t["id"] for _, t in tiers["no_project"]} == {"np1", "np2"}
+    assert {t["id"] for _, t in tiers["no_schedule"]} == {"ns1", "ns2"}
 
 
 def test_group_tiers_multi_project_active_wins():
@@ -247,20 +252,23 @@ def test_group_tiers_multi_project_done_without_active_is_integrity():
         [_task(project_ids=["fin", "wait"])], {"fin": "Done", "wait": "Pending"}
     )
     assert len(tiers["integrity"]) == 1
-    assert not tiers["active"] and not tiers["rest"]
+    assert not tiers["active"]
+    assert not tiers["no_project"] and not tiers["no_schedule"]
 
 
 def test_group_tiers_unknown_meta_demotes():
-    # 메타 조회 실패(빈 status) → ①/③ 판정 불가, ②/④ 강등
+    # 메타 조회 실패(빈 status) → ①/③ 판정 불가, 아래 티어로 강등
     tasks = [
         _task(
             id="u1", status="Pending", plan_start="2026-08-01", project_ids=["ghost"]
         ),
-        _task(id="u2", project_ids=["ghost"]),
+        _task(
+            id="u2", project_ids=["ghost"]
+        ),  # 프로젝트는 연결됨(상태만 미상) → 일정 없음
     ]
     tiers = _tiers(tasks, {})
     assert {t["id"] for _, t in tiers["scheduled"]} == {"u1"}
-    assert {t["id"] for _, t in tiers["rest"]} == {"u2"}
+    assert {t["id"] for _, t in tiers["no_schedule"]} == {"u2"}
 
 
 def test_group_tiers_internal_order_is_urgency():
@@ -385,7 +393,7 @@ def test_format_report_summary_and_tier_sections():
     assert "전체 3 · 지연 1 · 차단 0 · 진행중 1 · 대기 0 · 완료 1" in report
     # 1차 그룹은 프로젝트 티어 섹션
     assert "🔵 진행중 프로젝트 (1)" in report
-    assert "📦 기타 (1)" in report
+    assert "🧩 프로젝트 미연결 (1)" in report  # g1: 프로젝트 없음
     # 아이템은 urgency 이모지가 불릿
     assert "🔴 <https://notion.so/t1|태스크>" in report
     assert "✅ 완료" not in report  # 완료는 기본 개수만
@@ -396,14 +404,21 @@ def test_format_report_tier_section_order():
         _task(id="a", project_ids=["act"]),
         _task(id="s", status="Pending", plan_start="2026-08-01"),
         _task(id="i", project_ids=["fin"]),
-        _task(id="r", status="Pending"),
+        _task(id="np", status="Pending"),  # 프로젝트 미연결
+        _task(id="ns", status="Pending", project_ids=["wait"]),  # 일정 없음
     ]
-    report = _report(tasks, {"act": "In progress", "fin": "Done"})
+    report = _report(tasks, {"act": "In progress", "fin": "Done", "wait": "Pending"})
     positions = [
         report.index(label)
-        for label in ("🔵 진행중 프로젝트", "📅 예정", "⚠️ 정합성 이슈", "📦 기타")
+        for label in (
+            "🔵 진행중 프로젝트",
+            "📅 예정",
+            "⚠️ 정합성 이슈",
+            "🧩 프로젝트 미연결",
+            "🗓️ 일정 없음",
+        )
     ]
-    assert positions == sorted(positions)  # ①→②→③→④
+    assert positions == sorted(positions)  # ①→②→③→④→⑤
 
 
 def test_format_report_show_done_lists_items():
