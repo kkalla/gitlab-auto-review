@@ -288,12 +288,28 @@ def test_group_tiers_internal_order_is_urgency():
     ]
 
 
-def test_group_tiers_excludes_delayed():
-    # 지연 태스크는 티어 어디에도 안 들어간다 (최상단 지연 섹션 전용)
+def test_group_tiers_delayed_in_live_project_is_delayed():
+    # 살아있는(In progress) 프로젝트의 지연 → 🔴 지연 티어 (진짜 지연)
     tiers = _tiers(
         [_task(id="d", status="Delayed", project_ids=["p1"])], {"p1": "In progress"}
     )
-    assert not any(tiers.values())
+    assert [t["id"] for _, t in tiers["delayed"]] == ["d"]
+    assert not tiers["integrity"] and not tiers["active"]
+
+
+def test_group_tiers_delayed_in_closed_project_is_integrity():
+    # 종료 프로젝트의 지연 미완료 → 지연이 아니라 정합성 이슈로 (정합성에 따른 지연)
+    tiers = _tiers(
+        [_task(id="d", status="Delayed", project_ids=["p1"])], {"p1": "Done"}
+    )
+    assert [t["id"] for _, t in tiers["integrity"]] == ["d"]
+    assert not tiers["delayed"]
+
+
+def test_group_tiers_delayed_without_project_is_delayed():
+    # 프로젝트 없는 지연 → 종료 프로젝트가 아니므로 진짜 지연 취급
+    tiers = _tiers([_task(id="d", status="Delayed")], {})
+    assert [t["id"] for _, t in tiers["delayed"]] == ["d"]
 
 
 # ── project_meta_resolver ───────────────────────────────────────────────────
@@ -428,9 +444,10 @@ def test_format_report_delayed_at_top():
 
 def test_format_report_tier_section_order():
     tasks = [
-        _task(id="a", project_ids=["act"]),
-        _task(id="s", status="Pending", plan_start="2026-08-01"),
-        _task(id="i", project_ids=["fin"]),
+        _task(id="i", project_ids=["fin"]),  # 정합성
+        _task(id="dl", status="Delayed", project_ids=["act"]),  # 지연
+        _task(id="a", project_ids=["act"]),  # 진행중
+        _task(id="s", status="Pending", plan_start="2026-08-01"),  # 예정
         _task(id="np", status="Pending"),  # 프로젝트 미연결
         _task(id="ns", status="Pending", project_ids=["wait"]),  # 일정 없음
     ]
@@ -438,14 +455,15 @@ def test_format_report_tier_section_order():
     positions = [
         report.index(label)
         for label in (
+            "⚠️ 정합성 이슈",
+            "🔴 지연",
             "🔵 진행중 프로젝트",
             "📅 예정",
-            "⚠️ 정합성 이슈",
             "🧩 프로젝트 미연결",
             "🗓️ 일정 없음",
         )
     ]
-    assert positions == sorted(positions)  # ①→②→③→④→⑤
+    assert positions == sorted(positions)  # 정합성→지연→진행중→예정→미연결→일정없음
 
 
 def test_format_report_show_done_lists_items():
@@ -455,9 +473,69 @@ def test_format_report_show_done_lists_items():
 
 
 def test_format_report_caps_section():
-    many = [_task(id=f"t{i}", status="Delayed") for i in range(13)]  # 전부 티어④
+    many = [_task(id=f"t{i}", status="Delayed") for i in range(13)]  # 전부 지연 티어
     report = _report(many)
     assert "… 외 3건" in report
+
+
+# ── 그룹 뷰 (_split_group_option / group_by / format_grouped_report) ──────────
+
+
+def test_split_group_option_extracts_keyword():
+    assert ns._split_group_option("프로젝트별 지연") == ("project", "지연")
+    assert ns._split_group_option("담당자별") == ("assignee", "")
+    assert ns._split_group_option("지연") == (None, "지연")
+    assert ns._split_group_option("") == (None, "")
+
+
+def test_group_by_project_orders_by_count_and_complements_assignee():
+    tasks = [
+        _task(id="a1", assignees=["Kim"], project_ids=["p1"]),
+        _task(id="a2", assignees=["Lee"], project_ids=["p1"]),
+        _task(id="b1", assignees=["Kim"], project_ids=["p2"]),
+    ]
+    buckets = ns.classify(tasks, TODAY)
+    title = lambda pid: {"p1": "알파", "p2": "베타"}[pid]  # noqa: E731
+    grouped = ns.group_by(buckets, "project", title)
+    assert [name for name, _ in grouped] == ["알파", "베타"]  # 태스크 수 desc
+    report = ns.format_grouped_report(buckets, TODAY, "project", title)
+    assert "📁 알파 (2)" in report
+    assert "Kim" in report  # 프로젝트로 묶으면 담당자를 곁들임
+
+
+def test_group_by_assignee_and_none_group():
+    tasks = [
+        _task(id="a", assignees=["Kim"], project_ids=["p1"]),
+        _task(id="b"),  # 담당자 없음
+    ]
+    buckets = ns.classify(tasks, TODAY)
+    title = lambda pid: "알파"  # noqa: E731
+    grouped = dict(ns.group_by(buckets, "assignee", title))
+    assert "Kim" in grouped and "(담당자 없음)" in grouped
+    report = ns.format_grouped_report(buckets, TODAY, "assignee", title)
+    assert "👤 Kim (1)" in report
+    assert "알파" in report  # 담당자로 묶으면 프로젝트를 곁들임
+
+
+def test_group_by_multi_value_duplicates_across_groups():
+    # 다중 프로젝트 태스크는 각 그룹에 중복 표시
+    tasks = [_task(id="x", project_ids=["p1", "p2"])]
+    buckets = ns.classify(tasks, TODAY)
+    title = lambda pid: {"p1": "알파", "p2": "베타"}[pid]  # noqa: E731
+    grouped = dict(ns.group_by(buckets, "project", title))
+    assert {t["id"] for _, t in grouped["알파"]} == {"x"}
+    assert {t["id"] for _, t in grouped["베타"]} == {"x"}
+
+
+def test_group_by_none_group_sorts_last():
+    tasks = [
+        _task(id="n"),  # 프로젝트 없음
+        _task(id="a", project_ids=["p1"]),
+        _task(id="b", project_ids=["p1"]),
+    ]
+    buckets = ns.classify(tasks, TODAY)
+    grouped = ns.group_by(buckets, "project", lambda pid: "알파")
+    assert grouped[-1][0] == "(프로젝트 없음)"  # 없음 그룹은 맨 뒤
 
 
 def test_format_report_item_meta():

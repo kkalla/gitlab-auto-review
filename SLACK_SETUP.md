@@ -175,9 +175,11 @@ MR이 열릴 때마다 자동으로 리뷰가 돌게 하려면, GitLab이 MR 링
 MR 리뷰와 별개로, Notion 현황을 슬래시 커맨드 **두 개**로 조회한다.
 Socket Mode라 **Request URL 없이** 등록만 하면 된다.
 
-- **`/task-status`** — Tasks DB 태스크 리포트. 프로젝트 티어(진행중 프로젝트 →
-  예정(스케줄 확정·미시작) → ⚠️ 정합성 이슈(종료 프로젝트의 미완료 태스크) →
-  기타)로 묶고, 티어 안에선 지연→차단→진행중→대기 순 + 아이템 이모지(🔴🚧🔵⏸️).
+- **`/task-status`** — Tasks DB 태스크 리포트. 프로젝트 티어로 묶는다:
+  ⚠️ 정합성 이슈(종료 프로젝트 미완료) → 🔴 지연(살아있는 프로젝트의 진짜 지연,
+  N일 지남 표시) → 진행중 프로젝트 → 예정(스케줄 확정·미시작) → 프로젝트 미연결 →
+  일정 없음. 티어 안은 지연→차단→진행중→대기 순 + 아이템 이모지(🔴🚧🔵⏸️).
+  `프로젝트별`/`담당자별` 인자를 주면 티어 대신 그 축으로 묶어 본다.
 - **`/project-status`** — Projects DB 프로젝트 현황(진행중/예정/종료) + 프로젝트별
   태스크 완료율.
 
@@ -187,7 +189,7 @@ Socket Mode라 **Request URL 없이** 등록만 하면 된다.
    `/task-status`를 추가로 만들지 않으면 커맨드가 워크스페이스에 안 보인다.
    - Command: `/task-status`
      - Short Description: `Notion 태스크 현황 (프로젝트 티어 정렬)`
-     - Usage Hint: `[지연|차단|진행|대기|완료|담당자이름] [public]`
+     - Usage Hint: `[지연|차단|진행|대기|완료|담당자이름] [프로젝트별|담당자별] [public]`
    - Command: `/project-status`
      - Short Description: `Notion 프로젝트 현황 (진행중/예정/종료)`
      - Usage Hint: `[public]`
@@ -206,6 +208,8 @@ Socket Mode라 **Request URL 없이** 등록만 하면 된다.
 /task-status                 # 태스크 리포트 (나에게만 보임)
 /task-status 지연             # 지연 태스크만
 /task-status kkalla          # 담당자 이름 부분일치
+/task-status 프로젝트별        # 프로젝트별로 묶어 보기
+/task-status 담당자별 지연     # 담당자별 그룹 + 지연 필터
 /task-status public          # 채널 전체 공개로 게시
 /project-status              # 프로젝트 현황 (나에게만 보임)
 /project-status public       # 채널 전체 공개로 게시

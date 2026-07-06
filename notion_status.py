@@ -3,12 +3,11 @@
 slack_bot.py의 두 핸들러가 사용한다. Notion REST API로 DB 전체를 페이지네이션
 조회한 뒤 로컬에서 분류해 Slack mrkdwn 리포트 문자열을 만든다:
 
-- /task-status    — Tasks DB 태스크 리포트. 현재 날짜 기준 지연 태스크는 최상단
-                    🔴 지연 섹션에 프로젝트 무관하게 모으고(N일 지남 표시), 나머지는
-                    프로젝트 티어(진행중 프로젝트 → 예정 → 정합성 이슈(종료 프로젝트
-                    미완료) → 프로젝트 미연결 → 일정 없음)로 묶는다. 티어 안에선 기존
-                    urgency 분류(차단/진행중/대기)를 정렬 순서와 아이템 이모지
-                    (🚧🔵⏸️)로 유지한다.
+- /task-status    — Tasks DB 태스크 리포트. 프로젝트 티어로 묶는다: 정합성 이슈(종료
+                    프로젝트 미완료) → 🔴 지연(살아있는 프로젝트의 진짜 지연, N일 지남 표시)
+                    → 진행중 프로젝트 → 예정 → 프로젝트 미연결 → 일정 없음. 티어 안에선
+                    urgency 분류(지연/차단/진행중/대기)를 정렬 순서·아이템 이모지로 유지.
+                    '프로젝트별'/'담당자별' 인자를 주면 티어 대신 그 축으로 묶어 본다.
 - /project-status — Projects DB 프로젝트 현황(진행중/예정/종료) + 완료율.
                     완료율은 Completion rollup을 API로 읽지 않고 fetch_tasks
                     결과로 로컬 계산한다(관계 25개 초과 시 API rollup 부정확).
@@ -88,13 +87,28 @@ _BUCKET_EMOJI = {
 }
 
 # /task-status 1차 그룹(프로젝트 티어) 섹션 순서·라벨.
+# 정합성 이슈를 최상단으로 — 종료 프로젝트 미완료(정합성에 따른 지연)를 먼저 걷어내면
+# 그 아래 🔴 지연 섹션엔 살아있는 프로젝트의 '진짜 지연'만 남는다.
 _TIER_SECTIONS = (
+    ("integrity", "⚠️ 정합성 이슈 — 종료 프로젝트 미완료"),
+    ("delayed", "🔴 지연"),
     ("active", "🔵 진행중 프로젝트"),
     ("scheduled", "📅 예정 (스케줄 확정·미시작)"),
-    ("integrity", "⚠️ 정합성 이슈 — 종료 프로젝트 미완료"),
     ("no_project", "🧩 프로젝트 미연결"),
     ("no_schedule", "🗓️ 일정 없음"),
 )
+
+# /task-status 그룹 옵션 키워드 → 그룹 축. 티어 뷰 대신 프로젝트/담당자로 묶어 본다.
+_GROUP_KEYWORDS = {
+    "프로젝트별": "project",
+    "프로젝트": "project",
+    "project": "project",
+    "by-project": "project",
+    "담당자별": "assignee",
+    "담당자": "assignee",
+    "assignee": "assignee",
+    "by-assignee": "assignee",
+}
 
 # /project-status 상태 그룹 섹션 순서·라벨.
 _PROJECT_SECTIONS = (
@@ -317,44 +331,50 @@ def classify(tasks: list[dict], today: str) -> dict[str, list[dict]]:
 def group_tiers(
     buckets: dict[str, list[dict]], project_status: Callable[[str], str]
 ) -> dict[str, list[tuple[str, dict]]]:
-    """done 제외 태스크를 프로젝트 티어로 재편 — /task-status의 1차 그룹.
+    """done 제외 태스크를 프로젝트 티어로 재편 — /task-status의 1차 그룹(섹션).
 
-    urgency 순서(차단→진행중→대기)로 순회하며 배정하므로 티어 내 정렬이
+    urgency 순서(지연→차단→진행중→대기)로 순회하며 배정하므로 티어 내 정렬이
     저절로 유지된다. 아이템은 (버킷 키, 태스크) 쌍 — 버킷 키는 이모지 표시용.
-    지연(delayed) 버킷은 여기서 제외한다 — format_report가 최상단 🔴 지연
-    섹션으로 프로젝트 무관하게 따로 모은다(중복 방지).
 
-    티어 판정 (다중 프로젝트는 ① > ③):
-      ① active     — 프로젝트 하나라도 In progress
-      ③ integrity  — (①이 아니고) 종료 프로젝트(Done/Fail/Drop)의 미완료 태스크
-      ② scheduled  — 미시작 태스크(Pending/Not started/빈 상태) + Schedule (Plan) 있음
-      ④ no_project — 위 어디에도 안 걸리고 Project relation이 아예 없음(연결 필요)
-      ⑤ no_schedule— 그 외 (프로젝트는 있으나 진행중/종료도 아니고 예정도 아님; 주로 일정 미기입)
+    티어 판정 (위에서부터 우선):
+      integrity   — 종료 프로젝트(Done/Fail/Drop)의 미완료 태스크. 살아있는(In progress)
+                    프로젝트가 함께 걸려 있지 않은 경우. 지연이어도 여기로 — '정합성에 따른
+                    지연'을 진짜 지연과 분리한다.
+      delayed     — 지연 버킷(계획일 경과 or Delayed 상태)이면서 위 integrity가 아님.
+                    → 살아있는 맥락의 '진짜 지연'.
+      active      — 프로젝트 하나라도 In progress (지연 아님)
+      scheduled   — 미시작 태스크(Pending/Not started/빈 상태) + Schedule (Plan) 있음
+      no_project  — Project relation이 아예 없음(연결 필요)
+      no_schedule — 그 외 (프로젝트는 있으나 위 아님; 주로 일정 미기입)
 
-    메타 조회 실패로 status가 비면 ①/③ 판정 불가 → 그 아래 티어로 강등(의도된 동작).
+    메타 조회 실패로 status가 비면 integrity/active 판정 불가 → 그 아래 티어로 강등(의도).
     """
     tiers: dict[str, list[tuple[str, dict]]] = {
+        "integrity": [],
+        "delayed": [],
         "active": [],
         "scheduled": [],
-        "integrity": [],
         "no_project": [],
         "no_schedule": [],
     }
     for key in _BUCKET_EMOJI:
-        if key == "delayed":
-            continue  # 지연은 최상단 전용 섹션으로 분리 — 티어에 넣지 않는다
+        is_delayed = key == "delayed"
         for t in buckets[key]:
             statuses = [project_status(pid) for pid in t["project_ids"]]
             if PROJECT_ACTIVE_STATUS in statuses:
-                tier = "active"
+                # 살아있는 프로젝트: 지연이면 지연(진짜 지연), 아니면 진행중
+                tier = "delayed" if is_delayed else "active"
             elif any(s in PROJECT_DONE_STATUSES for s in statuses):
+                # 종료 프로젝트 미완료 — 지연이어도 정합성 이슈로(정합성에 따른 지연)
                 tier = "integrity"
+            elif is_delayed:
+                tier = "delayed"
             elif t["status"] in TASK_NOT_STARTED_STATUSES and (
                 t["plan_start"] or t["plan_end"]
             ):
                 tier = "scheduled"
             elif not t["project_ids"]:
-                # 프로젝트 미연결 — 티어 판정 자체가 불가한 더 근본 이슈라 먼저 가른다
+                # 프로젝트 미연결 — 티어 판정 자체가 불가한 더 근본 이슈
                 tier = "no_project"
             else:
                 tier = "no_schedule"
@@ -437,10 +457,10 @@ def format_report(
 ) -> str:
     """버킷+티어 → /task-status Slack mrkdwn 리포트. 섹션당 MAX_ITEMS_PER_SECTION개 + '외 N건'.
 
-    요약 라인은 기존 urgency 버킷 개수를 유지하고, 1차 그룹(섹션)은 프로젝트
-    티어(진행중 프로젝트/예정/정합성 이슈/프로젝트 미연결/일정 없음)다 — 아이템 앞 이모지(🔴🚧🔵⏸️)가
-    기존 분류를 노출한다. 완료는 평소 개수만 요약에 노출하고, done 키워드 필터일
-    때(show_done)만 목록을 편다 — 오래된 완료 태스크로 리포트가 길어지는 걸 막는다.
+    요약 라인은 기존 urgency 버킷 개수를 유지하고, 1차 그룹(섹션)은 프로젝트 티어
+    (정합성 이슈 → 지연 → 진행중 프로젝트 → 예정 → 미연결 → 일정 없음)다 — 아이템 앞
+    이모지(🔴🚧🔵⏸️)가 기존 분류를 노출한다. 지연 섹션 아이템엔 'N일 지남'을 덧붙인다.
+    완료는 평소 개수만 요약에 노출하고, done 키워드 필터일 때(show_done)만 목록을 편다.
     """
     counts = {k: len(v) for k, v in buckets.items()}
     total = sum(counts.values())
@@ -452,32 +472,112 @@ def format_report(
         f"전체 {total} · 지연 {counts['delayed']} · 차단 {counts['blocked']} · "
         f"진행중 {counts['in_progress']} · 대기 {counts['todo']} · 완료 {counts['done']}",
     ]
-    # 최상단 전용 지연 섹션 — 프로젝트 티어와 무관하게 지연 태스크를 먼저 모은다.
-    # 항목마다 '며칠 지났는지'를 붙이므로 티어 섹션과 렌더를 분리한다.
-    delayed = buckets["delayed"]
-    if delayed:
-        lines.append(f"\n*🔴 지연 ({len(delayed)})*")
-        lines.extend(
-            _format_item(t, project_title, "🔴", overdue_days=_days_overdue(t, today))
-            for t in delayed[:MAX_ITEMS_PER_SECTION]
-        )
-        if len(delayed) > MAX_ITEMS_PER_SECTION:
-            lines.append(f"… 외 {len(delayed) - MAX_ITEMS_PER_SECTION}건")
-
-    sections = [(label, tiers[key]) for key, label in _TIER_SECTIONS]
+    sections = [(key, label, tiers[key]) for key, label in _TIER_SECTIONS]
     if show_done:
-        sections.append(("✅ 완료", [("done", t) for t in buckets["done"]]))
-    for label, items in sections:
+        sections.append(("done", "✅ 완료", [("done", t) for t in buckets["done"]]))
+    for key, label, items in sections:
         if not items:
             continue
         lines.append(f"\n*{label} ({len(items)})*")
+        for bucket, t in items[:MAX_ITEMS_PER_SECTION]:
+            # 지연 섹션에서만 'N일 지남'을 붙인다(계획 종료일 기준).
+            overdue = _days_overdue(t, today) if key == "delayed" else 0
+            lines.append(
+                _format_item(t, project_title, _BUCKET_EMOJI.get(bucket, "•"), overdue)
+            )
+        if len(items) > MAX_ITEMS_PER_SECTION:
+            lines.append(f"… 외 {len(items) - MAX_ITEMS_PER_SECTION}건")
+    if total == 0:
+        lines.append("\n조건에 맞는 태스크가 없어요.")
+    return "\n".join(lines)
+
+
+def _format_grouped_item(
+    task: dict, bullet: str, group: str, project_title: Callable[[str], str]
+) -> str:
+    """그룹 뷰 아이템 — 헤딩이 그룹 축을 이미 보여주므로 본문엔 보완 축만 붙인다.
+
+    프로젝트로 묶으면 담당자를, 담당자로 묶으면 프로젝트를 곁들이고 일정·우선순위를 덧붙인다.
+    """
+    parts = [f"{bullet} <{task['url']}|{task['name']}>"]
+    meta = []
+    if group == "assignee":  # 담당자로 묶었으니 프로젝트를 곁들임
+        proj = " · ".join(
+            filter(None, (project_title(pid) for pid in task["project_ids"]))
+        )
+        if proj:
+            meta.append(proj)
+    elif task["assignees"]:  # 프로젝트로 묶었으니 담당자를 곁들임
+        meta.append(", ".join(task["assignees"]))
+    due = (task["plan_end"] or task["plan_start"])[:10]
+    if due:
+        meta.append(f"~{due[5:]}")
+    if task["priority"] == "High":
+        meta.append("🔺High")
+    if meta:
+        parts.append(" — " + " · ".join(meta))
+    return "".join(parts)
+
+
+def group_by(
+    buckets: dict[str, list[dict]], group: str, project_title: Callable[[str], str]
+) -> list[tuple[str, list[tuple[str, dict]]]]:
+    """done 제외 태스크를 프로젝트/담당자별로 묶는다 — /task-status 그룹 뷰.
+
+    urgency 순서(지연→차단→진행중→대기)로 순회하므로 그룹 안 정렬이 유지된다.
+    다중 값(프로젝트·담당자 여럿)이면 각 그룹에 중복으로 넣고, 값이 없으면
+    '(프로젝트 없음)'/'(담당자 없음)' 그룹에 담는다. 그룹은 태스크 수 내림차순
+    (동수면 이름순) — 큰 덩어리를 위로. 반환은 (그룹명, [(버킷 키, 태스크)…]) 목록.
+    """
+    none_label = "(프로젝트 없음)" if group == "project" else "(담당자 없음)"
+    groups: dict[str, list[tuple[str, dict]]] = {}
+    for key in _BUCKET_EMOJI:
+        for t in buckets[key]:
+            if group == "project":
+                names = [n for n in map(project_title, t["project_ids"]) if n]
+            else:
+                names = list(t["assignees"])
+            for name in names or [none_label]:
+                groups.setdefault(name, []).append((key, t))
+    # 태스크 수 desc, 이름 asc. (없음) 그룹은 항상 맨 뒤로.
+    return sorted(
+        groups.items(),
+        key=lambda kv: (kv[0] == none_label, -len(kv[1]), kv[0]),
+    )
+
+
+def format_grouped_report(
+    buckets: dict[str, list[dict]],
+    today: str,
+    group: str,
+    project_title: Callable[[str], str],
+    note: str = "",
+) -> str:
+    """버킷 → 프로젝트/담당자별 그룹 뷰 리포트. 그룹당 MAX_ITEMS_PER_SECTION개 + '외 N건'."""
+    counts = {k: len(v) for k, v in buckets.items()}
+    total = sum(counts.values())
+    axis = "프로젝트" if group == "project" else "담당자"
+    icon = "📁" if group == "project" else "👤"
+    header = f"*📊 프로젝트 태스크 현황* ({today}) — {axis}별"
+    if note:
+        header += f" · {note}"
+    lines = [
+        header,
+        f"전체 {total} · 지연 {counts['delayed']} · 차단 {counts['blocked']} · "
+        f"진행중 {counts['in_progress']} · 대기 {counts['todo']} · 완료 {counts['done']}",
+    ]
+    grouped = group_by(buckets, group, project_title)
+    for name, items in grouped:
+        lines.append(f"\n*{icon} {name} ({len(items)})*")
         lines.extend(
-            _format_item(t, project_title, _BUCKET_EMOJI.get(bucket, "•"))
+            _format_grouped_item(
+                t, _BUCKET_EMOJI.get(bucket, "•"), group, project_title
+            )
             for bucket, t in items[:MAX_ITEMS_PER_SECTION]
         )
         if len(items) > MAX_ITEMS_PER_SECTION:
             lines.append(f"… 외 {len(items) - MAX_ITEMS_PER_SECTION}건")
-    if total == 0:
+    if not grouped:
         lines.append("\n조건에 맞는 태스크가 없어요.")
     return "\n".join(lines)
 
@@ -547,9 +647,29 @@ def format_projects_report(
 # ── 진입점 ──────────────────────────────────────────────────────────────────
 
 
+def _split_group_option(filter_text: str) -> tuple[str | None, str]:
+    """인자에서 그룹 키워드(프로젝트별/담당자별)를 떼어낸다 → (그룹 축, 나머지 필터).
+
+    첫 그룹 키워드만 인정하고 나머지 단어는 필터로 넘긴다. 그룹 키워드가 없으면 (None, 원본).
+    """
+    group: str | None = None
+    rest: list[str] = []
+    for w in (filter_text or "").split():
+        g = _GROUP_KEYWORDS.get(w.lower())
+        if g and group is None:
+            group = g
+        else:
+            rest.append(w)
+    return group, " ".join(rest)
+
+
 def build_report(filter_text: str = "") -> str:
-    """Notion 조회 + 분류 + 티어 재편 + 포맷. slack_bot의 /task-status 스레드에서 호출."""
+    """Notion 조회 + 분류 + (티어 재편|그룹) + 포맷. slack_bot의 /task-status 스레드에서 호출.
+
+    filter_text에 '프로젝트별'/'담당자별'이 있으면 그룹 뷰, 없으면 티어 뷰.
+    """
     today = date.today().isoformat()
+    group, filter_text = _split_group_option(filter_text)
     tasks = [parse_task(p) for p in fetch_tasks()]
     buckets = classify(tasks, today)
     buckets, note = apply_filter(buckets, filter_text)
@@ -559,13 +679,14 @@ def build_report(filter_text: str = "") -> str:
         meta = project_meta_resolver(bulk)
     except Exception:
         # 벌크 실패 시엔 페이지 GET 폴백도 봉인 — 전 프로젝트 GET 폭주를 막는다.
-        # 티어는 ②/④로 강등되지만 리포트는 렌더된다.
+        # 티어는 강등되지만 리포트는 렌더된다.
         logger.exception("Projects DB 벌크 조회 실패 — 프로젝트 메타 없이 진행")
         meta = project_meta_resolver({}, allow_fallback=False)
+    project_title = lambda pid: meta(pid)["name"]  # noqa: E731
+    if group:
+        return format_grouped_report(buckets, today, group, project_title, note)
     tiers = group_tiers(buckets, lambda pid: meta(pid)["status"])
-    return format_report(
-        buckets, tiers, today, lambda pid: meta(pid)["name"], note, show_done
-    )
+    return format_report(buckets, tiers, today, project_title, note, show_done)
 
 
 def build_projects_report() -> str:
