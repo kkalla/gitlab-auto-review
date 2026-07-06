@@ -462,6 +462,7 @@ def _format_project_item(project: dict, task_counts: dict[str, tuple[int, int]])
         meta.append(f"{start[5:]}~{end[5:]}")  # MM-DD~MM-DD (한쪽 없으면 그쪽만 생략)
     done, total = task_counts.get(project["id"], (0, 0))
     if total:  # 태스크 0개 프로젝트는 완료율 생략
+        meta.append(f"{round(done / total * 100)}%")
         meta.append(f"완료 {done}/{total}")
     if meta:
         parts.append(" — " + " · ".join(meta))

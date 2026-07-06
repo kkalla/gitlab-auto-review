@@ -469,7 +469,7 @@ def test_format_projects_report_item_meta_and_completion():
     )
     report = ns.format_projects_report([p], TODAY, {"p1": (3, 8)})
     assert (
-        "• <https://notion.so/p1|프로젝트> — Vision · kkalla · 07-01~09-30 · 완료 3/8"
+        "• <https://notion.so/p1|프로젝트> — Vision · kkalla · 07-01~09-30 · 38% · 완료 3/8"
         in report
     )
 

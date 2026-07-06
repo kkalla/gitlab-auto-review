@@ -29,3 +29,6 @@ Thumbs.db
 
 # 호스트별 Docker override (예시는 .example로 커밋)
 docker-compose.override.yml
+
+# 로컬 에이전트 CLI 잔여물 (Antigravity/Gemini — 절대경로 심링크라 레포 무관)
+.antigravitycli/
