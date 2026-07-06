@@ -12,8 +12,9 @@ WebSocket을 직접 연다(방화벽/NAT 무관).
                                  봇이 직접 리뷰어 지정 열린 MR의 source SHA를 주기적으로
                                  확인해 변경분(새 push)을 리뷰한다
 
-부가 기능(리뷰와 무관): /project-status 슬래시 커맨드 — Notion Tasks DB 현황
-조회(notion_status.py). NOTION_TOKEN 미설정이면 안내만 답한다.
+부가 기능(리뷰와 무관): 슬래시 커맨드 두 개 — /task-status(Notion Tasks DB
+태스크 리포트, 프로젝트 티어 정렬)·/project-status(Notion Projects DB 현황).
+백엔드는 notion_status.py. NOTION_TOKEN 미설정이면 안내만 답한다.
 
 공통 흐름:
       → URL/목록에서 project_id/mr_iid 해석
@@ -337,14 +338,38 @@ def handle_channel_message(event: dict, say) -> None:
     _dispatch_review(project_id, mr_iid, web_url, channel, thread_ts, say)
 
 
-@app.command("/project-status")
-def handle_project_status(ack, respond, command) -> None:
-    """/project-status [키워드|담당자] [public] — Notion Tasks DB 현황 리포트.
+def _respond_notion_report(respond, build, public: bool, cmd: str) -> None:
+    """Notion 리포트 스레드 본체 — 두 슬래시 커맨드 핸들러가 공유.
 
-    MR 리뷰와 무관한 부가 기능. Socket Mode라 슬래시 커맨드도 같은 WebSocket으로
-    들어온다(Request URL 불필요). Notion 조회(페이지네이션 + 프로젝트 제목 해석)가
-    Slack의 3초 ack 제한을 넘길 수 있어, ack만 즉시 하고 조회는 별도 스레드에서
-    respond(response_url)로 답한다. 기본 ephemeral, `public` 인자면 채널 공개.
+    조회 실패는 ⚠️ 오류로 답하고, respond 자체의 실패(response_url 만료·네트워크)도
+    잡아 로그만 남긴다 — 데몬 스레드라 예외가 새면 사용자는 ack만 보고 끝난다.
+    기본 ephemeral, public이면 채널 공개(오류는 항상 ephemeral).
+    """
+    try:
+        kwargs = {
+            "text": build(),
+            "response_type": "in_channel" if public else "ephemeral",
+        }
+    except Exception:
+        logger.exception("%s 조회 실패", cmd)
+        kwargs = {
+            "text": "⚠️ Notion 조회 중 오류가 발생했어요. 봇 로그를 확인해 주세요."
+        }
+    try:
+        respond(**kwargs)
+    except Exception:
+        logger.exception("%s 응답 전송 실패", cmd)
+
+
+@app.command("/task-status")
+def handle_task_status(ack, respond, command) -> None:
+    """/task-status [키워드|담당자] [public] — Notion Tasks DB 태스크 리포트.
+
+    MR 리뷰와 무관한 부가 기능. 1차 그룹은 프로젝트 티어(진행중 프로젝트 → 예정 →
+    정합성 이슈 → 기타), 티어 안은 지연→차단→진행중→대기 순. Socket Mode라 슬래시
+    커맨드도 같은 WebSocket으로 들어온다(Request URL 불필요). Notion 조회
+    (페이지네이션 + 프로젝트 메타 해석)가 Slack의 3초 ack 제한을 넘길 수 있어,
+    ack만 즉시 하고 조회는 별도 스레드에서 respond(response_url)로 답한다.
     """
     if not notion_status.enabled():
         ack("NOTION_TOKEN이 설정되지 않아 현황 조회를 사용할 수 없어요.")
@@ -353,17 +378,40 @@ def handle_project_status(ack, respond, command) -> None:
     public = "public" in words
     query = " ".join(w for w in words if w != "public")
     ack("📊 Notion에서 태스크 현황 조회 중…")
+    threading.Thread(
+        target=_respond_notion_report,
+        args=(
+            respond,
+            lambda: notion_status.build_report(query),
+            public,
+            "/task-status",
+        ),
+        daemon=True,
+    ).start()
 
-    def _run() -> None:
-        try:
-            report = notion_status.build_report(query)
-        except Exception:
-            logger.exception("/project-status 조회 실패")
-            respond(text="⚠️ Notion 조회 중 오류가 발생했어요. 봇 로그를 확인해 주세요.")
-            return
-        respond(text=report, response_type="in_channel" if public else "ephemeral")
 
-    threading.Thread(target=_run, daemon=True).start()
+@app.command("/project-status")
+def handle_project_status(ack, respond, command) -> None:
+    """/project-status [public] — Notion Projects DB 프로젝트 현황(진행중/예정/종료).
+
+    태스크 리포트는 /task-status로 이관됐다 — 여기 인자는 `public`뿐이고 나머지는
+    무시하되, 구 사용자 혼란을 막기 위해 ack에 이관 안내를 붙인다.
+    ack/스레드/공개 여부 패턴은 /task-status와 동일.
+    """
+    if not notion_status.enabled():
+        ack("NOTION_TOKEN이 설정되지 않아 현황 조회를 사용할 수 없어요.")
+        return
+    words = (command.get("text") or "").split()
+    public = "public" in words
+    msg = "📁 Notion에서 프로젝트 현황 조회 중…"
+    if any(w != "public" for w in words):
+        msg += " (태스크 필터 인자는 /task-status로 이관됐어요 — 여기선 무시)"
+    ack(msg)
+    threading.Thread(
+        target=_respond_notion_report,
+        args=(respond, notion_status.build_projects_report, public, "/project-status"),
+        daemon=True,
+    ).start()
 
 
 def _fetch_open_reviewer_mrs() -> list[dict]:
