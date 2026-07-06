@@ -601,7 +601,18 @@ def format_grouped_report(
     ]
     grouped = group_by(buckets, group, project_title, project_status)
     for name, items in grouped:
-        lines.append(f"\n*{icon} {name} ({len(items)})*")
+        # 그룹 헤딩에 지연·진행중 구성 표시(0은 생략). 나머지 버킷은 아이템 이모지로.
+        n_delayed = sum(1 for bucket, _ in items if bucket == "delayed")
+        n_progress = sum(1 for bucket, _ in items if bucket == "in_progress")
+        breakdown = " · ".join(
+            f"{label} {n}"
+            for label, n in (("지연", n_delayed), ("진행중", n_progress))
+            if n
+        )
+        head = f"*{icon} {name} ({len(items)})*"
+        if breakdown:
+            head += f" — {breakdown}"
+        lines.append(f"\n{head}")
         lines.extend(
             _format_grouped_item(
                 t, _BUCKET_EMOJI.get(bucket, "•"), group, project_title

@@ -503,6 +503,20 @@ def test_group_by_project_orders_by_count_and_complements_assignee():
     assert "Kim" in report  # 프로젝트로 묶으면 담당자를 곁들임
 
 
+def test_format_grouped_report_shows_delayed_progress_breakdown():
+    # 그룹 헤딩에 지연·진행중 개수 표시(0은 생략)
+    tasks = [
+        _task(id="a", status="Delayed", assignees=["Kim"]),
+        _task(id="b", status="In progress", assignees=["Kim"]),
+        _task(id="c", status="In progress", assignees=["Kim"]),
+        _task(id="d", status="Pending", assignees=["Lee"]),  # 대기만 → breakdown 없음
+    ]
+    buckets = ns.classify(tasks, TODAY)
+    report = ns.format_grouped_report(buckets, TODAY, "assignee", lambda pid: "")
+    assert "*👤 Kim (3)* — 지연 1 · 진행중 2" in report
+    assert "*👤 Lee (1)*\n" in report  # 지연·진행중 0이면 breakdown 생략
+
+
 def test_group_by_assignee_and_none_group():
     tasks = [
         _task(id="a", assignees=["Kim"], project_ids=["p1"]),
