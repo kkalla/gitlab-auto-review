@@ -272,7 +272,8 @@ def test_group_tiers_unknown_meta_demotes():
 
 
 def test_group_tiers_internal_order_is_urgency():
-    # 같은 티어 안에선 지연→차단→진행중→대기 순, 버킷 키가 이모지 표시용으로 실림
+    # 같은 티어 안에선 차단→진행중→대기 순, 버킷 키가 이모지 표시용으로 실림.
+    # (지연은 티어에서 제외 — 최상단 전용 섹션으로 빠진다)
     tasks = [
         _task(id="w", status="Pending", project_ids=["p1"]),
         _task(id="g", status="In progress", project_ids=["p1"]),
@@ -281,11 +282,18 @@ def test_group_tiers_internal_order_is_urgency():
     ]
     tiers = _tiers(tasks, {"p1": "In progress"})
     assert [(k, t["id"]) for k, t in tiers["active"]] == [
-        ("delayed", "d"),
         ("blocked", "b"),
         ("in_progress", "g"),
         ("todo", "w"),
     ]
+
+
+def test_group_tiers_excludes_delayed():
+    # 지연 태스크는 티어 어디에도 안 들어간다 (최상단 지연 섹션 전용)
+    tiers = _tiers(
+        [_task(id="d", status="Delayed", project_ids=["p1"])], {"p1": "In progress"}
+    )
+    assert not any(tiers.values())
 
 
 # ── project_meta_resolver ───────────────────────────────────────────────────
@@ -391,12 +399,31 @@ def test_format_report_summary_and_tier_sections():
     report = _report(tasks, {"p1": "In progress"})
     # 요약 라인은 기존 urgency 버킷 개수 유지
     assert "전체 3 · 지연 1 · 차단 0 · 진행중 1 · 대기 0 · 완료 1" in report
-    # 1차 그룹은 프로젝트 티어 섹션
-    assert "🔵 진행중 프로젝트 (1)" in report
+    # 지연은 최상단 전용 섹션 (프로젝트 티어에서 빠짐 — 진행중 프로젝트 티어 비어 미표시)
+    assert "🔴 지연 (1)" in report
+    assert "🔵 진행중 프로젝트" not in report  # d1이 지연으로 빠져 active 티어 비어있음
     assert "🧩 프로젝트 미연결 (1)" in report  # g1: 프로젝트 없음
-    # 아이템은 urgency 이모지가 불릿
+    # 지연 아이템은 🔴 불릿
     assert "🔴 <https://notion.so/t1|태스크>" in report
     assert "✅ 완료" not in report  # 완료는 기본 개수만
+
+
+def test_format_report_delayed_section_shows_days_overdue():
+    # 지연 섹션 아이템에 'N일 지남' 표시 (계획 종료일 기준)
+    tasks = [_task(id="od", status="In progress", plan_end="2026-07-01")]  # 5일 전
+    report = _report(tasks, {})
+    assert "🔴 지연 (1)" in report
+    assert "5일 지남" in report
+
+
+def test_format_report_delayed_at_top():
+    # 지연 섹션이 프로젝트 티어보다 위
+    tasks = [
+        _task(id="d", status="Delayed", project_ids=["act"]),
+        _task(id="ok", status="In progress", project_ids=["act"]),
+    ]
+    report = _report(tasks, {"act": "In progress"})
+    assert report.index("🔴 지연") < report.index("🔵 진행중 프로젝트")
 
 
 def test_format_report_tier_section_order():

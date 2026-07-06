@@ -3,11 +3,12 @@
 slack_bot.py의 두 핸들러가 사용한다. Notion REST API로 DB 전체를 페이지네이션
 조회한 뒤 로컬에서 분류해 Slack mrkdwn 리포트 문자열을 만든다:
 
-- /task-status    — Tasks DB 태스크 리포트. 1차 그룹은 프로젝트 티어(진행중
-                    프로젝트 → 예정 → 정합성 이슈(종료 프로젝트 미완료) →
-                    프로젝트 미연결 → 일정 없음),
-                    티어 안에선 기존 urgency 분류(지연/차단/진행중/대기)를
-                    정렬 순서와 아이템 이모지(🔴🚧🔵⏸️)로 유지한다.
+- /task-status    — Tasks DB 태스크 리포트. 현재 날짜 기준 지연 태스크는 최상단
+                    🔴 지연 섹션에 프로젝트 무관하게 모으고(N일 지남 표시), 나머지는
+                    프로젝트 티어(진행중 프로젝트 → 예정 → 정합성 이슈(종료 프로젝트
+                    미완료) → 프로젝트 미연결 → 일정 없음)로 묶는다. 티어 안에선 기존
+                    urgency 분류(차단/진행중/대기)를 정렬 순서와 아이템 이모지
+                    (🚧🔵⏸️)로 유지한다.
 - /project-status — Projects DB 프로젝트 현황(진행중/예정/종료) + 완료율.
                     완료율은 Completion rollup을 API로 읽지 않고 fetch_tasks
                     결과로 로컬 계산한다(관계 25개 초과 시 API rollup 부정확).
@@ -271,6 +272,18 @@ def _overdue(task: dict, today: str) -> bool:
     return bool(end) and end < today
 
 
+def _days_overdue(task: dict, today: str) -> int:
+    """계획 종료일 기준 지난 일수. 계획일 없음/미래거나 파싱 실패면 0(표시 생략)."""
+    due = (task["plan_end"] or task["plan_start"])[:10]
+    if not due or due >= today:
+        return 0
+    try:
+        return (date.fromisoformat(today) - date.fromisoformat(due)).days
+    except ValueError:
+        # Delayed 상태지만 계획일이 이상 문자열이면 일수 없이 넘긴다(🔴만 표시)
+        return 0
+
+
 def classify(tasks: list[dict], today: str) -> dict[str, list[dict]]:
     """태스크를 우선순위 순서(완료 → 지연 → 차단 → 진행중 → 대기)로 단일 버킷에 배정.
 
@@ -306,8 +319,10 @@ def group_tiers(
 ) -> dict[str, list[tuple[str, dict]]]:
     """done 제외 태스크를 프로젝트 티어로 재편 — /task-status의 1차 그룹.
 
-    urgency 순서(지연→차단→진행중→대기)로 순회하며 배정하므로 티어 내 정렬이
+    urgency 순서(차단→진행중→대기)로 순회하며 배정하므로 티어 내 정렬이
     저절로 유지된다. 아이템은 (버킷 키, 태스크) 쌍 — 버킷 키는 이모지 표시용.
+    지연(delayed) 버킷은 여기서 제외한다 — format_report가 최상단 🔴 지연
+    섹션으로 프로젝트 무관하게 따로 모은다(중복 방지).
 
     티어 판정 (다중 프로젝트는 ① > ③):
       ① active     — 프로젝트 하나라도 In progress
@@ -326,6 +341,8 @@ def group_tiers(
         "no_schedule": [],
     }
     for key in _BUCKET_EMOJI:
+        if key == "delayed":
+            continue  # 지연은 최상단 전용 섹션으로 분리 — 티어에 넣지 않는다
         for t in buckets[key]:
             statuses = [project_status(pid) for pid in t["project_ids"]]
             if PROJECT_ACTIVE_STATUS in statuses:
@@ -384,7 +401,10 @@ def apply_filter(
 
 
 def _format_item(
-    task: dict, project_title: Callable[[str], str], bullet: str = "•"
+    task: dict,
+    project_title: Callable[[str], str],
+    bullet: str = "•",
+    overdue_days: int = 0,
 ) -> str:
     parts = [f"{bullet} <{task['url']}|{task['name']}>"]
     meta = []
@@ -393,6 +413,8 @@ def _format_item(
     )
     if projects:
         meta.append(projects)
+    if overdue_days:  # 지연 섹션에서만 — 얼마나 지났는지
+        meta.append(f"{overdue_days}일 지남")
     if task["assignees"]:
         meta.append(", ".join(task["assignees"]))
     due = (task["plan_end"] or task["plan_start"])[:10]
@@ -430,6 +452,18 @@ def format_report(
         f"전체 {total} · 지연 {counts['delayed']} · 차단 {counts['blocked']} · "
         f"진행중 {counts['in_progress']} · 대기 {counts['todo']} · 완료 {counts['done']}",
     ]
+    # 최상단 전용 지연 섹션 — 프로젝트 티어와 무관하게 지연 태스크를 먼저 모은다.
+    # 항목마다 '며칠 지났는지'를 붙이므로 티어 섹션과 렌더를 분리한다.
+    delayed = buckets["delayed"]
+    if delayed:
+        lines.append(f"\n*🔴 지연 ({len(delayed)})*")
+        lines.extend(
+            _format_item(t, project_title, "🔴", overdue_days=_days_overdue(t, today))
+            for t in delayed[:MAX_ITEMS_PER_SECTION]
+        )
+        if len(delayed) > MAX_ITEMS_PER_SECTION:
+            lines.append(f"… 외 {len(delayed) - MAX_ITEMS_PER_SECTION}건")
+
     sections = [(label, tiers[key]) for key, label in _TIER_SECTIONS]
     if show_done:
         sections.append(("✅ 완료", [("done", t) for t in buckets["done"]]))
