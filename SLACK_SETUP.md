@@ -11,12 +11,12 @@
 - **자동·폴링** — 봇이 주기적으로(`POLL_INTERVAL_SEC`) reviewer 지정 열린 MR의 source SHA를
   확인해 **새 push(증분)**를 자동 리뷰한다(§7). GitLab Slack 알림은 push를 채널에 안
   띄우므로, MR에 커밋이 쌓일 때마다 자동 재리뷰하려면 이게 필요하다.
-- **수동·멘션** — `@mr-reviewer <MR URL>`로 직접 멘션. 특정 MR만 골라 리뷰할 때.
+- **수동·멘션** — `@ags-watchtower <MR URL>`로 직접 멘션. 특정 MR만 골라 리뷰할 때.
 
 ```
 (자동·채널) GitLab 채널 알림 → 봇 message 수신 → MR 링크 추출
 (자동·폴링) POLL_INTERVAL_SEC마다 열린 MR의 source SHA 확인 → 변경분(새 push)
-(수동·멘션) @mr-reviewer <MR URL> → 봇 app_mention 수신
+(수동·멘션) @ags-watchtower <MR URL> → 봇 app_mention 수신
   → project_id/mr_iid 해석
   → review_runner.py 서브프로세스 (증분은 MR 코멘트 reviewed-sha 마커로 자동)
   → 완료/실패 시 (멘션·채널은 스레드 답글 +) 리뷰어·assignee DM
@@ -29,10 +29,12 @@
 
 ```yaml
 display_information:
-  name: MR Reviewer
+  name: AGS Watchtower
+  description: GitLab MR 자동 코드 리뷰
+  background_color: "#1b2a4a"
 features:
   bot_user:
-    display_name: mr-reviewer
+    display_name: AGS Watchtower
     always_online: true
 oauth_config:
   scopes:
@@ -71,7 +73,7 @@ settings:
 
 ## 3. 봇을 채널에 초대 + 내 member ID 확인
 
-- 리뷰를 트리거할 채널에서 `/invite @mr-reviewer`.
+- 리뷰를 트리거할 채널에서 `/invite @ags-watchtower`.
 - 완료/실패 DM을 받을 "나"의 member ID: Slack 프로필 → **⋯ 더보기** →
   **멤버 ID 복사** (`U…`) → `REVIEWER_SLACK_ID`에.
 
@@ -121,7 +123,7 @@ podman compose logs -f ai-reviewer    # "Socket Mode 연결 시도" + "MR 폴러
 채널/스레드에서:
 
 ```
-@mr-reviewer https://git.sparklingsoda.ai:8443/vision/gitlab-auto-review/-/merge_requests/123
+@ags-watchtower https://git.sparklingsoda.ai:8443/vision/gitlab-auto-review/-/merge_requests/123
 ```
 
 봇이 스레드에 ack → 리뷰 완료 시 MR 코멘트 + 스레드 답글 + 리뷰어·assignee DM.
@@ -131,7 +133,7 @@ podman compose logs -f ai-reviewer    # "Socket Mode 연결 시도" + "MR 폴러
 MR이 열릴 때마다 자동으로 리뷰가 돌게 하려면, GitLab이 MR 링크를 채널에 뿌리고
 봇이 그 링크를 잡게 한다. 멘션도 추가 inbound 포트도 필요 없다.
 
-1. **봇을 알림 채널에 초대**: `/invite @mr-reviewer` (§3에서 했으면 생략).
+1. **봇을 알림 채널에 초대**: `/invite @ags-watchtower` (§3에서 했으면 생략).
 2. **GitLab Slack notification 켜기**: 대상 프로젝트 → **Settings → Integrations →
    **Slack notifications** → *Active* 체크.
    - **Webhook**: Slack incoming webhook URL (Slack 앱의 *Incoming Webhooks* 또는
@@ -167,6 +169,9 @@ MR이 열릴 때마다 자동으로 리뷰가 돌게 하려면, GitLab이 MR 링
 - 끄려면 `.env`에 `POLL_INTERVAL_SEC=0` — 그러면 채널 알림(§6)·멘션(§5)만 동작한다.
 - 트레이드오프: push 후 최대 한 폴링 간격(기본 5분)만큼 지연된다. 봇 재시작 직후의 push는
   baseline에 흡수돼 한 번 놓칠 수 있다(그땐 수동 `@멘션`으로 처리).
+
+> Notion 현황 조회(`/task-status`·`/project-status`)는 96_ags-watchtower 레포로
+> 분리됐다 — 이 봇/앱엔 없다.
 
 ## assignee DM이 안 오는 경우
 

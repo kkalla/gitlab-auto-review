@@ -12,6 +12,9 @@ WebSocket을 직접 연다(방화벽/NAT 무관).
                                  봇이 직접 리뷰어 지정 열린 MR의 source SHA를 주기적으로
                                  확인해 변경분(새 push)을 리뷰한다
 
+Notion 조회 슬래시 커맨드(/task-status·/project-status)는 96_ags-watchtower로
+분리됐다 — 이 봇은 MR 리뷰 전용이다.
+
 공통 흐름:
       → URL/목록에서 project_id/mr_iid 해석
       → review_runner.py 서브프로세스 실행 (증분 리뷰는 review_runner가 MR
@@ -293,7 +296,7 @@ def handle_mention(event: dict, say) -> None:
             thread_ts=thread_ts,
             text=(
                 "리뷰할 MR을 못 찾았어요. GitLab Merge Request URL을 함께 멘션해 주세요.\n"
-                "예: `@mr-reviewer https://git.example.com/group/repo/-/merge_requests/123`"
+                "예: `@ags-watchtower https://git.example.com/group/repo/-/merge_requests/123`"
             ),
         )
         return
