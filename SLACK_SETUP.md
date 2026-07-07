@@ -30,7 +30,7 @@
 ```yaml
 display_information:
   name: AGS Watchtower
-  description: GitLab MR 자동 코드 리뷰 + Notion 프로젝트·태스크 현황 조회
+  description: GitLab MR 자동 코드 리뷰
   background_color: "#1b2a4a"
 features:
   bot_user:
@@ -170,53 +170,8 @@ MR이 열릴 때마다 자동으로 리뷰가 돌게 하려면, GitLab이 MR 링
 - 트레이드오프: push 후 최대 한 폴링 간격(기본 5분)만큼 지연된다. 봇 재시작 직후의 push는
   baseline에 흡수돼 한 번 놓칠 수 있다(그땐 수동 `@멘션`으로 처리).
 
-## 8. (부가 기능) /task-status·/project-status — Notion 현황
-
-MR 리뷰와 별개로, Notion 현황을 슬래시 커맨드 **두 개**로 조회한다.
-Socket Mode라 **Request URL 없이** 등록만 하면 된다.
-
-- **`/task-status`** — Tasks DB 태스크 리포트. 프로젝트 티어로 묶는다:
-  ⚠️ 정합성 이슈(종료 프로젝트 미완료) → 🔴 지연(살아있는 프로젝트의 진짜 지연,
-  N일 지남 표시) → 진행중 프로젝트 → 예정(스케줄 확정·미시작) → 프로젝트 미연결 →
-  일정 없음. 티어 안은 지연→차단→진행중→대기 순 + 아이템 이모지(🔴🚧🔵⏸️).
-  `프로젝트별`/`담당자별` 인자를 주면 티어 대신 그 축으로 묶어 본다.
-- **`/project-status`** — Projects DB 프로젝트 현황(진행중/예정/종료) + 프로젝트별
-  태스크 완료율.
-
-1. **Slack 앱에 커맨드 2개 등록**: [api.slack.com/apps](https://api.slack.com/apps) →
-   해당 앱 → **Slash Commands → Create New Command**. **`/task-status`는 신규
-   등록이 필요하다** — 기존에 `/project-status`만 등록해 둔 앱이라면
-   `/task-status`를 추가로 만들지 않으면 커맨드가 워크스페이스에 안 보인다.
-   - Command: `/task-status`
-     - Short Description: `Notion 태스크 현황 (프로젝트 티어 정렬)`
-     - Usage Hint: `[지연|차단|진행|대기|완료|담당자이름] [프로젝트별|담당자별] [public]`
-   - Command: `/project-status`
-     - Short Description: `Notion 프로젝트 현황 (진행중/예정/종료)`
-     - Usage Hint: `[public]`
-   - Socket Mode가 켜져 있으면 Request URL은 입력하지 않는다.
-2. 앱 **재설치**(Reinstall to Workspace) — `commands` 스코프가 자동 추가된다.
-3. **Notion 통합 발급**: [notion.so/my-integrations](https://www.notion.so/my-integrations)에서
-   internal integration 생성 → secret을 `.env`의 `NOTION_TOKEN`에.
-   capability에 **사용자 정보 읽기**를 켜야 Assignee/Owner 이름이 나온다.
-4. **DB에 통합 연결**: Tasks DB와 **Projects DB 둘 다** 우상단 `⋯` → 연결 →
-   통합 선택. DB가 다르면 `.env`의 `NOTION_TASKS_DB_ID` /
-   `NOTION_PROJECTS_DB_ID`를 바꾼다.
-
-사용:
-
-```
-/task-status                 # 태스크 리포트 (나에게만 보임)
-/task-status 지연             # 지연 태스크만
-/task-status kkalla          # 담당자 이름 부분일치
-/task-status 프로젝트별        # 프로젝트별로 묶어 보기
-/task-status 담당자별 지연     # 담당자별 그룹 + 지연 필터
-/task-status public          # 채널 전체 공개로 게시
-/project-status              # 프로젝트 현황 (나에게만 보임)
-/project-status public       # 채널 전체 공개로 게시
-```
-
-`NOTION_TOKEN`이 비어 있으면 두 커맨드는 안내 문구만 답하고, 봇의 다른
-기능(리뷰 트리거)엔 영향이 없다.
+> Notion 현황 조회(`/task-status`·`/project-status`)는 96_ags-watchtower 레포로
+> 분리됐다 — 이 봇/앱엔 없다.
 
 ## assignee DM이 안 오는 경우
 

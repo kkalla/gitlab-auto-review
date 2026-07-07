@@ -87,20 +87,10 @@ Review is **clone-based**: `review_runner.py` shallow-clones the repo into a tem
 - 세 트리거는 `_dispatch_review()`를 공유하고 `(project_id, mr_iid)` in-flight 가드로 중복을 막는다 — 멘션 메시지는 `app_mention`·`message` 둘 다 발생하지만 먼저 잡은 쪽만 실행된다. 봇 자신의 답글이 `message`로 되돌아와 재트리거되는 것은 Bolt 기본 `ignoring_self_events`가 막는다.
 - **폴러**(`_poll_loop`, 데몬 스레드)는 첫 순회를 **baseline**으로 잡고(봇 기동 시 기존 MR 일괄 리뷰 방지) 이후 source SHA가 바뀐 MR만 트리거한다. 폴링 트리거는 `channel`/`say` 없이 `_dispatch_review`를 호출해 **스레드 답글 없이 조용히** 돌고(결과는 review_runner의 MR 코멘트 + DM), `_post`는 `channel`이 없으면 no-op이다. `POLL_INTERVAL_SEC=0`이면 폴러 비활성화. 봇 재시작 시 baseline이 비어 그 사이 push는 한 번 놓칠 수 있다(수동 멘션으로 커버).
 - 봇은 oldrev를 넘기지 않는다 — 증분 리뷰는 review_runner가 MR 코멘트의 `reviewed-sha` 마커로 자체 처리하므로 `@멘션` 수동 트리거에서도 정상 동작한다.
-- `slack_bot.py`만 `slack_bolt`에 의존한다. `review_runner.py`/`slack_notifier.py`/`notion_status.py`는 `httpx`만 쓴다 — review_runner의 테스트 의존성을 가볍게 유지하기 위함(테스트는 `slack_bolt` 미설치로도 통과).
+- `slack_bot.py`만 `slack_bolt`에 의존한다. `review_runner.py`/`slack_notifier.py`는 `httpx`만 쓴다 — review_runner의 테스트 의존성을 가볍게 유지하기 위함(테스트는 `slack_bolt` 미설치로도 통과).
 
-### Notion 현황 (`notion_status.py`, /task-status·/project-status)
-
-MR 리뷰와 무관한 Slack 봇 부가 기능. 슬래시 커맨드 **두 개**가 Notion을 REST API로 전체 페이지네이션 조회한 뒤 **로컬에서 분류**해 mrkdwn 리포트로 답한다. Socket Mode라 커맨드도 WebSocket으로 들어온다(Request URL 불필요) — 핸들러는 `ack()`만 즉시 하고(3초 제한) 조회는 별도 스레드에서 `respond()`로 답한다(`_respond_notion_report` 공유). 기본 ephemeral, `public` 인자면 채널 공개.
-
-- **`/task-status [지연|차단|진행|대기|완료|담당자이름] [프로젝트별|담당자별] [public]`** — Tasks DB(`NOTION_TASKS_DB_ID`) 태스크 리포트. 1차 그룹은 **프로젝트 티어**(위에서부터 우선): ⚠️ 정합성 이슈(종료 프로젝트 Done/Fail/Drop의 미완료 태스크 — 지연이어도 여기, '정합성에 따른 지연'을 분리) → 🔴 지연(살아있는 In progress 프로젝트의 미완료 지연, `Schedule (Plan)` 종료일 경과 기준 + 'N일 지남' 표시) → 진행중 프로젝트 → 예정(미시작 + `Schedule (Plan)` 있음) → 프로젝트 미연결(Project relation 없음) → 일정 없음. 티어 안은 urgency 분류(지연→차단→진행중→대기) 순 + 아이템 이모지(🔴🚧🔵⏸️). `프로젝트별`/`담당자별` 인자(`_GROUP_KEYWORDS`)를 주면 티어 대신 그 축으로 묶어 본다(`group_by`/`format_grouped_report`, done 제외, 다중 값은 각 그룹 중복, 그룹은 태스크 수 desc, 값 없으면 `(프로젝트/담당자 없음)`).
-- **`/project-status [public]`** — Projects DB(`NOTION_PROJECTS_DB_ID`) 프로젝트 현황(진행중/예정/종료) + 완료율. 완료율은 `Completion` rollup을 API로 읽지 않고(관계 25개 초과 시 부정확) `fetch_tasks` 결과에서 로컬 계산(`project_task_counts`), 태스크 0개면 생략.
-- urgency 분류 우선순위: Done/Drop → 지연(`Delayed` 상태 또는 계획 일정 경과) → 차단(미완료 `Blocked by` 존재) → 진행중 → 대기. blocker 상태 해석을 위해 Done 포함 전체를 가져온다. 조회 결과에 없는 blocker는 미완료로 간주(보수적).
-- 프로젝트 메타(제목·상태)는 Projects DB **벌크 쿼리 1회**로 맵을 만들고(`fetch_projects`+`parse_project`), 맵에 없는 id(아카이브 등)만 페이지 GET 폴백(`project_meta_resolver`, dict 캐시). 조회 실패는 빈 메타로 강등 — 빈 status는 티어 ②/④로 떨어지고 리포트는 렌더된다(예외 전파 금지).
-- Notion API 버전은 `2022-06-28` 고정 — `databases/{id}/query`가 기본 data source를 직접 질의한다(2025-09 버전의 data_source id 단계 회피).
-- `NOTION_TOKEN` 미설정이면 `enabled()` False → 두 커맨드는 안내만 답하고 봇 부팅엔 영향 없음(slack_notifier와 같은 원칙). `NOTION_TOKEN`은 `_TOKEN` 접미사라 review_runner의 fail-secure denylist가 claude env에서 자동으로 가린다.
-- 테스트는 `tests/test_notion_status.py` — 순수 함수(parse/classify/tier/filter/format)만. 리졸버는 `_fetch_page_meta` monkeypatch로 폴백 경로만 검증.
-- Slack 앱에 Slash Command **2개** 등록(`/task-status`는 신규 등록 필요) + Notion 통합의 Tasks·Projects DB 연결 필요 — `SLACK_SETUP.md` §8.
+Notion 현황 조회(`/task-status`·`/project-status`, `notion_status.py`)는 2026-07-07에
+`96_ags-watchtower` 레포로 분리됐다 — 이 레포는 MR 리뷰 전용이다.
 
 ### Slack 알림 (`slack_notifier.py`)
 
@@ -189,9 +179,6 @@ Slack 봇 모드 (`slack_bot.py`):
 - `SLACK_APP_TOKEN` (`xapp-…`) — App-Level 토큰, `connections:write`. Socket Mode 전용. 봇 부팅 필수.
 - `REVIEWER_SLACK_ID` (`U…`) — 완료/실패 DM을 받을 리뷰어 member ID. 선택 — 비면 리뷰어 DM 생략(assignee DM은 이메일 매핑으로 별도).
 - `POLL_INTERVAL_SEC` (default 300) — 폴러 주기(초). reviewer 지정 열린 MR의 source SHA를 이 주기로 확인해 push 증분을 자동 리뷰한다. `0`이면 폴러 비활성화(채널알림·멘션만). slack_bot 전용.
-- `NOTION_TOKEN` — Notion internal integration secret. 선택 — 비면 `/task-status`·`/project-status`만 비활성(안내 답변). 대상 DB(Tasks·Projects)에 통합 연결 필요.
-- `NOTION_TASKS_DB_ID` (default 제1연구센터 Tasks) — `/task-status`가 조회할 Tasks DB ID (완료율 계산에도 사용).
-- `NOTION_PROJECTS_DB_ID` (default 제1연구센터 Projects) — `/project-status`와 `/task-status` 티어 판정이 조회할 Projects DB ID.
 
 ## Conventions
 
