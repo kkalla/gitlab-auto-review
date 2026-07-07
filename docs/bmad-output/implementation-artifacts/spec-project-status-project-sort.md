@@ -89,6 +89,10 @@ context: []
 
 ## Suggested Review Order
 
+> **Note (2026-07-07)**: 이 스펙의 구현 파일(`notion_status.py`, `tests/test_notion_status.py`,
+> `slack_bot.py`의 관련 핸들러)은 `96_ags-watchtower` 레포로 이관됐습니다. 아래 파일 링크는
+> 이 레포 기준으로는 무효합니다 — 완료된 작업의 이력으로만 참고하세요.
+
 **티어 재편 — /task-status의 새 1차 그룹**
 
 - 진입점: 조회→분류→티어→포맷 배선과 벌크 실패 시 GET 폴백 봉인 판단

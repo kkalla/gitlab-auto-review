@@ -7,4 +7,7 @@
 
 ## Deferred from: code review of spec-project-status-project-sort (2026-07-06)
 
+> **Note (2026-07-07)**: `notion_status.py`는 `96_ags-watchtower` 레포로 이관됐다. 아래
+> 항목은 그 레포에서 계속 유효하다 — 이 레포의 deferred-work가 아니다.
+
 - **[LOW] Slack mrkdwn 이스케이프 부재** — `notion_status.py` `_format_item`/`_format_project_item`. Notion 유래 이름·URL을 `<url|name>` 링크에 이스케이프 없이 삽입 — 이름에 `&`/`<`/`>`/`|`가 있으면 링크가 깨지거나 표시가 왜곡될 수 있다. **사유**: 기존 태스크 아이템부터 있던 패턴(이번 스토리가 프로젝트 아이템으로 표면만 확장). 사내 DB라 악용 가능성 낮음. 수정 시 `&→&amp;, <→&lt;, >→&gt;` 치환 헬퍼 하나로 두 포맷터 공통 처리.

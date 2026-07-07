@@ -22,7 +22,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY webhook_server.py review_runner.py slack_bot.py slack_notifier.py notion_status.py ./
+COPY webhook_server.py review_runner.py slack_bot.py slack_notifier.py ./
 
 # 기본 진입점 = Slack Socket Mode 봇 (공개 inbound 포트 불필요 — 봇이 아웃바운드
 # WebSocket을 연다). webhook 모드로 돌리려면 compose에서 command를 아래로 덮어쓴다:
