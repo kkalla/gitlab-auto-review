@@ -39,6 +39,13 @@ services:
       # 넣고 시작 시 컨테이너 로컬로 복사한다. 호스트에 이 파일이 존재해야 한다
       # (호스트에서 `claude login`을 한 번이라도 했다면 존재한다).
       - ${HOME}/.claude.json:/seed/.claude.json:ro
+      # ~/.claude/settings.json의 PreToolUse(Bash) 훅이 이 절대경로를 참조한다.
+      # 마운트된 settings.json이 컨테이너 안 claude에도 적용되는데, 스크립트가
+      # 없으면 python3가 exit 2로 죽어 "훅 차단"으로 오인되고 모든 Bash 호출
+      # (git diff 포함)이 막힌다. 타깃 경로는 훅에 적힌 호스트 절대경로와
+      # 글자 그대로 일치해야 한다. :ro 단일 파일 마운트 — 컨테이너가 쓰지
+      # 않으므로 .claude.json의 atomic-rename 문제는 해당 없음.
+      - ${HOME}/00_Projects/95_personal-memory/scrub/block_env_dump.py:/Users/max/00_Projects/95_personal-memory/scrub/block_env_dump.py:ro
     env_file:
       - .env
     restart: unless-stopped
