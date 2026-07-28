@@ -20,8 +20,8 @@ podman machine start
 # 2) podman compose는 docker-compose/podman-compose 중 설치된 provider를 호출한다.
 podman compose up -d --build
 podman compose logs -f ai-reviewer
-# 마운트되는 ${HOME}/.claude·${HOME}/.claude.json은 호스트에서 `claude login`이
-# 끝나 있어야 한다(컨테이너가 그 세션을 재사용). macOS엔 SELinux가 없어 `:z` 불필요.
+# 마운트되는 ${HOME}/.claude-work·${HOME}/.claude는 호스트에서 세션이 한 번은
+# 만들어져 있어야 한다(설정/에이전트를 재사용). macOS엔 SELinux가 없어 `:z` 불필요.
 
 # Local Python (still requires env vars from .env)
 pip install -r requirements.txt
@@ -126,7 +126,9 @@ A webhook `update` fires on every push to the MR, so a re-review would otherwise
 The container authenticates `claude` with a **long-lived OAuth token** (`CLAUDE_CODE_OAUTH_TOKEN`, from `claude setup-token` on the host) — a Claude **subscription** token, **not** `ANTHROPIC_API_KEY`. Why a token env var instead of just mounting the host session:
 
 - **macOS Keychain isn't portable.** The host (macOS) stores its OAuth token in the Keychain, which the Linux container can't read. Mounting `~/.claude` / `~/.claude.json` carries config but **not** the token — `claude -p` then fails with `Not logged in`. `claude setup-token` prints a ~1-year token that bypasses Keychain; it flows `.env` → compose `env_file` → `review_runner`'s `claude_env` → the `claude` subprocess.
-- `~/.claude` is still mounted **read-write** (Claude Code's Bash tool writes `~/.claude/shell-snapshots/`; a `:ro` mount breaks it with `EROFS`). But `~/.claude.json` is **not** mounted directly: a single-file bind mount + podman virtiofs breaks claude's atomic-rename rewrite of that file (it vanishes → `Claude configuration file not found`). Instead it's mounted **read-only at `/seed/.claude.json`** and the compose `entrypoint` copies it to a container-local `/root/.claude.json` on start. See `docker-compose.yml`.
+- The container runs on the **work config dir**, `CLAUDE_CONFIG_DIR=/Users/max/.claude-work` (the host's `claude-work` alias is just `CLAUDE_CONFIG_DIR=~/.claude-work claude` — an alias, so there is no `claude-work` binary to exec; `review_runner.py` still invokes plain `claude`).
+- Both `~/.claude-work` and `~/.claude` are mounted **at their host absolute paths, not under `/root`**. `~/.claude-work/{agents,hooks,rules,CLAUDE.md,commands,scripts,statusline.sh}` are absolute symlinks into `/Users/max/.claude/`; mounting elsewhere leaves them dangling, and a missing `agents` silently collapses `/review-pr` to a single pass (its six subagents vanish). `settings.json` hook commands are absolute host paths too, for the same reason.
+- Both are mounted **read-write** (Bash tool writes `shell-snapshots/`; `.claude.json` rewrite and OAuth refresh need writes; `:ro` breaks with `EROFS`). Mounting the *directory* (not the single `.claude.json` file) also sidesteps the podman-virtiofs atomic-rename bug that used to require a `/seed` copy at entrypoint — that trick is gone.
 - If `claude -p` fails with `Not logged in`, the token is missing/expired — re-run `claude setup-token` on the host and update `CLAUDE_CODE_OAUTH_TOKEN` in `.env`. (The `/login` short-lived OAuth token dies in ~8h with no refresh; the `setup-token` long-lived token does not — use setup-token.)
 - `ANTHROPIC_API_KEY` stays intentionally absent — auth is the subscription OAuth token, not the API.
 - **Security trade-off**: `CLAUDE_CODE_OAUTH_TOKEN` must reach the `claude` subprocess (it *is* the auth), so `claude_env` passes it through — unlike the stripped secrets. With `ALLOWED_TOOLS` permitting full `Bash`, a prompt-injection could read it from env; narrowing the allowlist back to `Bash(git:*)` shrinks that surface.
