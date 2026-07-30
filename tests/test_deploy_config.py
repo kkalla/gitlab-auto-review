@@ -103,3 +103,23 @@ def test_settings_hook_points_inside_image():
             f"훅이 이미지 밖 경로를 참조한다: {command!r} — 호스트 경로 의존은 "
             "마운트 dangling으로 전 Bash 차단 사고를 재발시킨다"
         )
+
+
+def test_dockerfile_pins_claude_version():
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    assert re.search(
+        r"npm install -g @anthropic-ai/claude-code@\d+\.\d+\.\d+", dockerfile
+    ), (
+        "claude 버전이 고정되지 않았다 — 재배포마다 최신이 들어와 "
+        "배포가 조용한 업그레이드가 된다"
+    )
+
+
+def test_dockerfile_bakes_claude_config():
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    assert re.search(
+        r"^COPY claude-config/ /opt/reviewer-claude/", dockerfile, re.M
+    ), "claude-config/를 이미지에 COPY하지 않는다"
+    assert re.search(
+        r"^ENV CLAUDE_CONFIG_DIR=/opt/reviewer-claude", dockerfile, re.M
+    ), "CLAUDE_CONFIG_DIR을 이미지에서 설정하지 않는다"
