@@ -2,3 +2,6 @@
 # (Dockerfile은 requirements.txt만 COPY/install).
 -r requirements.txt
 pytest==8.3.3
+# tests/test_deploy_config.py가 에이전트 frontmatter를 파싱한다.
+# uvicorn[standard]의 전이 의존으로도 들어오지만, 직접 쓰므로 명시한다.
+PyYAML==6.0.3
