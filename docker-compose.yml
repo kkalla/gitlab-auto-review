@@ -48,7 +48,14 @@ services:
       # (git diff 포함)이 막힌다. 타깃 경로는 훅에 적힌 호스트 절대경로와
       # 글자 그대로 일치해야 한다. (같은 settings.json의 SessionStart/Stop 훅은
       # 마운트하지 않는다 — 실패해도 차단하지 않는 훅이라 무해하다.)
-      - ${HOME}/00_Projects/95_personal-memory/scrub/block_env_dump.py:/Users/max/00_Projects/95_personal-memory/scrub/block_env_dump.py:ro
+      #
+      # **파일이 아니라 디렉토리로 마운트한다.** 단일 파일 bind-mount는 호스트에서
+      # 그 파일을 수정할 때(에디터의 atomic rename = inode 교체) podman/virtiofs가
+      # 새 inode를 따라가지 못해 컨테이너 안에서 `-?????????? block_env_dump.py`로
+      # dangling 된다 → python3가 "can't open file"로 exit 2 → 모든 Bash 호출 차단
+      # → 리뷰가 `git diff`조차 못 돌린다(2026-07-30 실측). .claude.json에서 겪은
+      # 것과 같은 버그다. 디렉토리 마운트는 inode 교체에 영향받지 않는다.
+      - ${HOME}/00_Projects/95_personal-memory/scrub:/Users/max/00_Projects/95_personal-memory/scrub:ro
     env_file:
       - .env
     restart: unless-stopped
