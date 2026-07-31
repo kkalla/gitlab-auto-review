@@ -155,3 +155,45 @@ def test_compose_does_not_override_config_dir():
     assert "CLAUDE_CONFIG_DIR" not in keys, (
         "compose가 CLAUDE_CONFIG_DIR을 덮어쓴다 — Dockerfile ENV만 쓸 것"
     )
+
+
+# 코드가 이름으로 읽지 않고 서브프로세스 상속으로만 소비하는 변수.
+# review_runner는 os.environ를 그대로 claude에 물려주므로(비밀 접미사만
+# strip) OAuth 토큰은 소스에 이름이 나타나지 않는다 — grep으로는 안 잡힌다.
+SUBPROCESS_ONLY_ENV = {"CLAUDE_CODE_OAUTH_TOKEN"}
+
+_ENV_READ_RE = re.compile(
+    r'(?:os\.environ(?:\.get)?\(\s*|_required_env\(\s*)"([A-Z_]+)"'
+)
+
+
+def _env_read_by_code() -> set[str]:
+    names: set[str] = set()
+    for module in ROOT.glob("*.py"):
+        names |= set(_ENV_READ_RE.findall(module.read_text(encoding="utf-8")))
+    return names
+
+
+def _env_in_example() -> set[str]:
+    names: set[str] = set()
+    for line in (ROOT / ".env.example").read_text(encoding="utf-8").splitlines():
+        match = re.match(r"([A-Z_]+)=", line.strip())
+        if match:
+            names.add(match.group(1))
+    return names
+
+
+def test_env_example_has_no_dead_vars():
+    dead = _env_in_example() - _env_read_by_code() - SUBPROCESS_ONLY_ENV
+    assert not dead, (
+        f".env.example의 죽은 변수: {sorted(dead)} — 안 쓰는 시크릿을 "
+        "새 호스트/credential로 옮기지 않도록 정리할 것"
+    )
+
+
+def test_env_example_documents_all_read_vars():
+    undocumented = _env_read_by_code() - _env_in_example()
+    assert not undocumented, (
+        f".env.example에 없는 변수: {sorted(undocumented)} — 배포 credential에 "
+        "빠지면 컨테이너가 부팅에 실패하거나 기능이 조용히 사라진다"
+    )
