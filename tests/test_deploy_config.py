@@ -197,3 +197,21 @@ def test_env_example_documents_all_read_vars():
         f".env.example에 없는 변수: {sorted(undocumented)} — 배포 credential에 "
         "빠지면 컨테이너가 부팅에 실패하거나 기능이 조용히 사라진다"
     )
+
+
+def test_jenkinsfile_uses_fixed_project_name():
+    jenkinsfile = (ROOT / "Jenkinsfile").read_text(encoding="utf-8")
+    assert "docker compose -p gitlab-auto-review " in jenkinsfile, (
+        "고정 프로젝트명이 없다 — Jenkins 워크스페이스 디렉토리명이 바뀌면 "
+        "컨테이너가 중복 생성된다"
+    )
+
+
+def test_jenkinsfile_loads_env_from_credential_and_cleans_up():
+    jenkinsfile = (ROOT / "Jenkinsfile").read_text(encoding="utf-8")
+    assert "credentialsId: 'gitlab-auto-review-env'" in jenkinsfile, (
+        ".env를 Jenkins credential에서 가져오지 않는다"
+    )
+    assert "rm -f .env" in jenkinsfile, (
+        "빌드 후 .env 정리가 없다 — 시크릿이 Jenkins 워크스페이스에 남는다"
+    )
