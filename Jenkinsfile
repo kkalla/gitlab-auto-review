@@ -81,6 +81,15 @@ pipeline {
             sh 'rm -f .env'
         }
         success {
+            // ponytail: `docker image prune -f`(비-`-a`)는 dangling(태그 없는) 이미지만
+            // 지운다 — 이 서비스의 태그된 이미지나 실행 중 컨테이너가 참조하는 레이어는
+            // 안 건드린다. 다만 dangling 이미지는 호스트 전역 스코프라, 196-server가
+            // 다른 Jenkins job과 공유되면 그쪽의 미태그 빌드 캐시도 같이 지워질 수 있다.
+            // `docker compose build`가 이미지에 com.docker.compose.project 라벨을 남기는지는
+            // compose 버전에 따라 갈린다(2.38.2대 회귀 이력 있음, docker/compose#13048) —
+            // 이 레포는 196-server의 정확한 compose 버전을 고정하지 않으므로 라벨 필터로
+            // 좁히는 건 검증 없이 넣지 않는다. 호스트가 실제로 공유된다고 확인되면 그때
+            // compose 버전을 고정하고 라벨 필터를 추가할 것.
             sh 'docker image prune -f'
         }
     }
