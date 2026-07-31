@@ -123,3 +123,35 @@ def test_dockerfile_bakes_claude_config():
     assert re.search(
         r"^ENV CLAUDE_CONFIG_DIR=/opt/reviewer-claude", dockerfile, re.M
     ), "CLAUDE_CONFIG_DIR을 이미지에서 설정하지 않는다"
+
+
+def _compose_service() -> dict:
+    compose = yaml.safe_load(
+        (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    )
+    return compose["services"]["ai-reviewer"]
+
+
+def test_compose_has_no_host_mounts():
+    service = _compose_service()
+    assert "volumes" not in service, (
+        "호스트 마운트가 부활했다 — config는 이미지에 굽는다(claude-config/). "
+        "호스트 절대경로·심링크·단일 파일 마운트 의존이 리뷰 중단 사고 "
+        "두 건의 원인이었다"
+    )
+
+
+def test_compose_does_not_override_config_dir():
+    """CLAUDE_CONFIG_DIR은 Dockerfile ENV가 담당한다.
+
+    compose가 중복 지정하면 이미지에 구운 경로와 어긋나 config를 못 읽는다.
+    compose의 environment는 map/list 두 형태가 모두 유효하므로 둘 다 본다.
+    """
+    environment = _compose_service().get("environment") or {}
+    if isinstance(environment, dict):
+        keys = set(environment)
+    else:
+        keys = {entry.split("=", 1)[0] for entry in environment}
+    assert "CLAUDE_CONFIG_DIR" not in keys, (
+        "compose가 CLAUDE_CONFIG_DIR을 덮어쓴다 — Dockerfile ENV만 쓸 것"
+    )

@@ -12,50 +12,11 @@ services:
     #   command: ["uvicorn", "webhook_server:app", "--host", "0.0.0.0", "--port", "8080"]
     #   ports:
     #     - "8080:8080"
+    #   (그 경우 .env에 WEBHOOK_SECRET도 다시 넣을 것 — Slack 봇 모드에선 안 쓴다.)
     command: ["python", "slack_bot.py"]
-    environment:
-      # 업무용 config 디렉토리(호스트 alias `claude-work`의 실체)를 컨테이너에서도 쓴다.
-      # alias는 컨테이너에 존재하지 않으므로 review_runner는 여전히 `claude`를 부르고,
-      # 계정/설정 분리는 이 env var가 담당한다.
-      # 경로가 `/root/...`가 아니라 호스트 절대경로인 이유는 아래 volumes 주석 참고.
-      CLAUDE_CONFIG_DIR: /Users/max/.claude-work
-    volumes:
-      # 호스트의 Claude credentials/설정 마운트 (핵심).
-      #
-      # **컨테이너 안에서도 호스트와 동일한 절대경로에 건다.** ~/.claude-work/ 내부의
-      # agents·hooks·rules·CLAUDE.md·commands·scripts·statusline.sh는 전부
-      # `/Users/max/.claude/...`를 가리키는 **절대 심링크**다. `/root/.claude-work`로
-      # 마운트하면 이 심링크들이 통째로 dangling 되고, 특히 agents가 사라지면
-      # `/review-pr`이 띄우는 서브에이전트 6개가 죽어 리뷰가 단일 패스로 붕괴한다.
-      # settings.json의 훅들도 호스트 절대경로를 그대로 참조하므로 같은 이유로 유리하다.
-      #
-      # rw 필수 — claude의 Bash 도구가 shell-snapshots/에 쓰고, .claude.json 재작성과
-      # OAuth 토큰 갱신도 쓰기가 필요하다. :ro면 EROFS로 Bash 도구가 깨진다.
-      # 디렉토리(파일 아님) 마운트라 claude의 .claude.json atomic-rename도 정상 동작한다
-      # — 예전 seed+copy entrypoint 트릭은 단일 파일 bind-mount 한정 문제여서 제거했다.
-      # 트레이드오프: 호스트에서 claude-work 세션을 돌리는 중에 컨테이너 리뷰가 겹치면
-      # 같은 .claude.json에 동시 쓰기가 난다(실측 문제 없으면 그대로 둔다).
-      #
-      # ─ macOS + Podman: podman machine VM이 $HOME을 동일 경로로 공유하므로 그대로 전달된다.
-      #   macOS엔 SELinux가 없으니 `:z`/`:Z`를 **붙이지 말 것**.
-      # ─ Linux + SELinux(enforcing) 호스트에 배포할 때만 끝에 `:z`를 추가한다.
-      - ${HOME}/.claude-work:/Users/max/.claude-work
-      # 위 심링크들의 실제 타깃. 마운트하지 않으면 .claude-work의 심링크가 전부 끊긴다.
-      - ${HOME}/.claude:/Users/max/.claude
-      # .claude-work/settings.json의 PreToolUse(Bash) 훅이 이 절대경로를 참조한다.
-      # 마운트된 settings.json이 컨테이너 안 claude에도 적용되는데, 스크립트가
-      # 없으면 python3가 exit 2로 죽어 "훅 차단"으로 오인되고 모든 Bash 호출
-      # (git diff 포함)이 막힌다. 타깃 경로는 훅에 적힌 호스트 절대경로와
-      # 글자 그대로 일치해야 한다. (같은 settings.json의 SessionStart/Stop 훅은
-      # 마운트하지 않는다 — 실패해도 차단하지 않는 훅이라 무해하다.)
-      #
-      # **파일이 아니라 디렉토리로 마운트한다.** 단일 파일 bind-mount는 호스트에서
-      # 그 파일을 수정할 때(에디터의 atomic rename = inode 교체) podman/virtiofs가
-      # 새 inode를 따라가지 못해 컨테이너 안에서 `-?????????? block_env_dump.py`로
-      # dangling 된다 → python3가 "can't open file"로 exit 2 → 모든 Bash 호출 차단
-      # → 리뷰가 `git diff`조차 못 돌린다(2026-07-30 실측). .claude.json에서 겪은
-      # 것과 같은 버그다. 디렉토리 마운트는 inode 교체에 영향받지 않는다.
-      - ${HOME}/00_Projects/95_personal-memory/scrub:/Users/max/00_Projects/95_personal-memory/scrub:ro
+    # 마운트 없음 — 리뷰용 claude config는 이미지에 구워져 있다(claude-config/,
+    # Dockerfile의 COPY + ENV CLAUDE_CONFIG_DIR). 호스트 경로에 의존하지 않으므로
+    # 어느 호스트에서든 동일하게 뜬다.
     env_file:
       - .env
     restart: unless-stopped
