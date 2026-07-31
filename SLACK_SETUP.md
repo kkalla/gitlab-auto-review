@@ -88,9 +88,9 @@ cp .env.example .env
 
 **Claude 인증 토큰 발급 (필수, 호스트에서 1회):**
 
-컨테이너의 `claude`는 호스트 macOS Keychain을 못 읽으므로 `~/.claude` 마운트만으로는
-인증이 안 된다(`Not logged in`). 호스트에서 구독 기반 **장기 토큰**(약 1년 유효)을 발급해
-`.env`에 넣는다 — `ANTHROPIC_API_KEY`는 쓰지 않는다.
+리뷰 config(`claude-config/`)는 이미지에 구워져 있어 마운트가 없다 — 호스트에서
+발급받아 옮겨야 할 건 인증 토큰 하나뿐이다. 호스트에서 구독 기반 **장기 토큰**(약 1년
+유효)을 발급해 `.env`에 넣는다 — `ANTHROPIC_API_KEY`는 쓰지 않는다.
 
 ```bash
 claude setup-token        # 브라우저 OAuth → 출력된 토큰을 복사
@@ -100,23 +100,16 @@ claude setup-token        # 브라우저 OAuth → 출력된 토큰을 복사
 > 토큰이 노출됐거나 만료되면 `claude setup-token`을 다시 실행해 회전하고 `.env`를
 > 갱신한다. (`claude /login`의 단기 토큰은 ~8시간 만에 만료되니 봇용으로 쓰지 말 것.)
 
-**macOS + Podman (권장 타깃):**
+**로컬 테스트용:** 실제 배포 타깃은 196-server(Jenkins 자동 배포) — 절차는
+`CLAUDE.md`의 Run/debug 절 참고. 로컬에서 빌드·동작만 확인하려면:
 
 ```bash
-# 최초 1회: Linux VM 준비 (claude+node+git이라 리소스 넉넉히)
-podman machine init --cpus 4 --memory 4096   # 이미 있으면 생략
-podman machine start
-
-podman compose up -d --build
-podman compose logs -f ai-reviewer    # "Socket Mode 연결 시도" + "MR 폴러 시작" 로그 확인
+docker compose up -d --build
+docker compose logs -f ai-reviewer    # "Socket Mode 연결 시도" + "MR 폴러 시작" 로그 확인
 ```
 
-> `podman compose`는 `docker-compose`나 `podman-compose` 중 설치된 provider를
-> 호출하는 래퍼다. 없으면 `brew install docker-compose` 또는
-> `pip install podman-compose` 중 하나를 깔면 된다. macOS엔 SELinux가 없어
-> compose의 `${HOME}/.claude` 마운트에 `:z`/`:Z`를 붙이지 않는다.
-
-**Docker를 쓰는 경우:** 위 `podman compose`를 `docker compose`로 바꾸면 된다.
+마운트가 없으므로(config는 이미지에 구워짐) Docker든 Podman(`podman compose`)이든
+동일하게 뜬다 — SELinux `:z`/`:Z` 같은 마운트 관련 주의사항은 해당 없음.
 
 ## 5. 사용 (수동 트리거)
 

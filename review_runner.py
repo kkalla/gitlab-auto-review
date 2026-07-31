@@ -101,7 +101,8 @@ RETRY_ATTEMPTS = 2
 # 메인 에이전트는 Bash(git:*)로 좁혀 임의 shell 실행 표면을 제한한다. Task는 /review-pr
 # 서브에이전트(code-reviewer·pr-test-analyzer 등) 스폰에 필요 — 없으면 단일 패스로 축소된다.
 # 단, 부모 --allowed-tools는 Task 서브에이전트에 전파되지 않으므로(claude 설계) 각 서브에이전트
-# 정의(호스트 ~/.claude/agents/)에서도 별도로 Bash(git:*)로 좁혀야 한다(이 repo 밖, 배포 시 필수).
+# 정의(이 repo의 claude-config/agents/, 이미지에 구워짐)에서도 별도로 Bash(git:*)로 좁혀야
+# 한다 — tests/test_deploy_config.py가 이 좁히기를 불변식으로 강제한다.
 # Bash(git:*)도 `git -c core.pager=…`/`git -c http.extraHeader=…` 등으로 우회 가능해 완전한
 # RCE 차단은 아니다 — CLAUDE_CODE_OAUTH_TOKEN을 strip할 수 없는 구조상 이 스코핑이 1차 방어선이다.
 ALLOWED_TOOLS = "Read,Glob,Grep,Bash(git:*),Task"
@@ -975,9 +976,10 @@ def run_claude_review(
     # claude 서브프로세스에서 자격증명 env를 제거한다.
     # clone/fetch는 이 함수 호출 전에 이미 끝났고, claude는 클론된 로컬 레포에서
     # git diff/log/show만 돌리므로 GITLAB_TOKEN·WEBHOOK_SECRET·SLACK_* 모두 불필요하다.
-    # ALLOWED_TOOLS는 메인을 Bash(git:*)로 좁히고, /review-pr 서브에이전트들도 호스트
-    # ~/.claude/agents/에서 Bash(git:*)로 좁혀(부모 --allowed-tools는 서브에 전파 안 됨 —
-    # 서브에이전트 정의 자체를 좁혀야 한다) 임의 shell 실행 경로를 줄였다. 그래도 best-effort
+    # ALLOWED_TOOLS는 메인을 Bash(git:*)로 좁히고, /review-pr 서브에이전트들도
+    # claude-config/agents/(이미지에 구워짐, tests/test_deploy_config.py가 강제)에서
+    # Bash(git:*)로 좁혀(부모 --allowed-tools는 서브에 전파 안 됨 — 서브에이전트 정의
+    # 자체를 좁혀야 한다) 임의 shell 실행 경로를 줄였다. 그래도 best-effort
     # 방어로 토큰은 strip한다 — 단 CLAUDE_CODE_OAUTH_TOKEN은 claude 인증에 필요해 strip
     # 못 하므로(env에 남음), Bash 스코핑이 그 토큰을 지키는 1차 방어가 된다.
     claude_env = {k: v for k, v in os.environ.items() if not _is_secret_env(k)}

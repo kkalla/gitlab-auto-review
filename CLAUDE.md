@@ -12,8 +12,10 @@ FastAPI service that receives GitLab MR webhooks and posts AI code review commen
 # 배포 (196-server) — 태그 푸시 후 Jenkins가 3분 내 폴링해서 배포한다
 git tag v1.x.y && git push gitlab v1.x.y
 
-# 로그
-ssh 196-server 'docker compose -p gitlab-auto-review logs -f ai-reviewer'
+# 로그 (container_name이 고정이라 cwd 무관하게 동작)
+ssh 196-server 'docker logs -f gitlab-ai-reviewer'
+# docker compose down/재시작 등 compose 자체가 필요하면 Jenkins job의
+# 워크스페이스 디렉토리로 cd한 뒤 실행할 것 (ssh 'cmd'는 $HOME에서 시작함)
 
 # 로컬 이미지 검증 (서버 손대기 전) — claude-config/가 이미지에 제대로 구워졌는지 확인
 podman build -t reviewer-selfcontained:test . && \

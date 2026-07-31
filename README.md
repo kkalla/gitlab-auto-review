@@ -19,7 +19,7 @@ GitLab 사내 인스턴스에서 본인이 리뷰어로 지정된 MR에 대해 C
    출력된 토큰을 Jenkins credential(`gitlab-auto-review-env`, Secret file)의
    `CLAUDE_CODE_OAUTH_TOKEN=...` 줄에 넣는다. 배경은 `CLAUDE.md`의 Auth model 절 참고.
 2. GitLab Personal Access Token 발급 (`api` 스코프) — GitLab → Preferences → Access Tokens
-3. Webhook 시크릿용 임의의 긴 랜덤 문자열 준비
+3. Webhook 시크릿용 임의의 긴 랜덤 문자열 준비 (webhook 모드 전용 — 기본 CMD인 Slack 봇 모드라면 생략 가능)
 
 ## 셋업
 
@@ -57,8 +57,12 @@ git tag v1.x.y && git push gitlab v1.x.y
 로그 확인:
 
 ```bash
-ssh 196-server 'docker compose -p gitlab-auto-review logs -f ai-reviewer'
+ssh 196-server 'docker logs -f gitlab-ai-reviewer'
 ```
+
+(`container_name`이 고정이라 cwd 무관하게 동작한다. `docker compose down`/재시작처럼
+compose 자체가 필요하면 Jenkins job의 워크스페이스 디렉토리로 먼저 `cd`해야 한다 —
+`ssh host 'cmd'`는 `$HOME`에서 시작한다.)
 
 **로컬 실행** (호스트 마운트 없음 — `claude-config/`가 이미지에 구워져 있어 어느 환경에서든 동일하게 뜬다):
 
@@ -138,7 +142,7 @@ MR에 커밋이 push될 때마다 webhook `update`가 발동해 리뷰가 다시
 
 | 증상 | 원인 | 해결 |
 |---|---|---|
-| 부팅 직후 즉시 종료 | `WEBHOOK_SECRET` 16자 미만 또는 `change-me*` 시작 | 랜덤 시크릿 재생성 후 `.env` 갱신 |
+| 부팅 직후 즉시 종료 (webhook 모드 한정) | `WEBHOOK_SECRET` 16자 미만 또는 `change-me*` 시작 | 랜덤 시크릿 재생성 후 `.env` 갱신 |
 | 부팅 직후 즉시 종료 + `GITLAB_URL` 에러 | http/https 아닌 스킴, 또는 `user:pass@` 포함 | URL을 `https://gitlab.예제.com` 형태로 정리 |
 | 401 응답만 반복 | 헤더/시크릿 불일치 | GitLab Webhook 설정의 Secret Token과 `.env`의 `WEBHOOK_SECRET` 일치 확인 |
 | `review in progress` 응답 반복 | 같은 MR로 webhook 빨리 두 번 옴 (의도된 차단) | 첫 리뷰 끝나면 in-flight set이 자동 해제됨 |
