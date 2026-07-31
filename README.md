@@ -34,7 +34,7 @@ cp .env.example .env
 |---|---|---|
 | `GITLAB_URL` | `https://gitlab.사내.도메인` | 끝 슬래시 X. `http(s)://`만 허용. embedded auth(`user:pass@`) 거부 |
 | `GITLAB_TOKEN` | `glpat-...` | `api` 스코프 PAT |
-| `WEBHOOK_SECRET` | 랜덤 16자 이상 | `change-me*`로 시작하면 부팅 거부 |
+| `WEBHOOK_SECRET` | 랜덤 16자 이상 | webhook 모드(`webhook_server.py`) 전용 — 기본 CMD인 Slack 봇 모드(`slack_bot.py`)는 이 변수를 읽지 않는다. webhook 모드에서 `change-me*`로 시작하면 부팅 거부 |
 | `REVIEWER_USERNAME` | `max` | 리뷰 트리거 대상 GitLab username + 리뷰 실패 시 알림 코멘트의 `@`멘션 대상 (생략 시 `max`) |
 
 `WEBHOOK_SECRET` 생성 한 줄:
@@ -52,7 +52,7 @@ docker compose up -d --build
 docker compose logs -f ai-reviewer
 ```
 
-부팅 시 `WEBHOOK_SECRET` 길이/패턴, `GITLAB_URL` 스킴, 필수 env 누락 여부를 검증한다. 검증 실패 시 컨테이너가 즉시 종료되므로 로그에서 사유 확인.
+부팅 시 `GITLAB_URL` 스킴, 필수 env 누락 여부를 검증한다(두 모드 공통). `WEBHOOK_SECRET` 길이/패턴 검증은 webhook 모드(`webhook_server.py`)에서만 수행된다 — 기본 CMD인 Slack 봇 모드는 이 변수를 아예 읽지 않으므로 배포 credential에 넣을 필요가 없다. 검증 실패 시 컨테이너가 즉시 종료되므로 로그에서 사유 확인.
 
 `~/.claude` 마운트는 rw로 둔다 — `claude`의 Bash 도구가 `~/.claude/shell-snapshots/`에 쓰고 OAuth 토큰 갱신도 쓰기가 필요해, `:ro`면 `EROFS`로 Bash 도구가 깨진다. `claude` 호출은 `--allowed-tools` 화이트리스트(읽기 도구 + git 하위명령)로 제한되어 git 외 임의 명령 실행은 차단된다.
 
