@@ -72,6 +72,25 @@ def test_review_agent_tools_are_narrowed(name):
     )
 
 
+def test_no_unexpected_agent_files():
+    names = {p.stem for p in (CONFIG / "agents").glob("*.md")}
+    assert names == set(REVIEW_AGENTS), (
+        f"claude-config/agents/의 실제 파일 {sorted(names)}이 REVIEW_AGENTS와 "
+        "다르다 — 새 에이전트 파일은 REVIEW_AGENTS에도 추가해야 tools 좁히기 "
+        "테스트가 커버한다"
+    )
+
+
+def test_review_pr_command_tools_are_narrowed():
+    fm = _frontmatter(CONFIG / "commands" / "review-pr.md")
+    tools = fm.get("allowed-tools")
+    assert tools is not None, "review-pr.md: allowed-tools 미지정 = 전체 도구 허용"
+    assert "Bash" not in tools, (
+        "review-pr.md가 좁혀지지 않은 bare Bash를 선언한다 — Bash(git:*)처럼 "
+        "scope된 형태여야 한다(CLAUDE_CODE_OAUTH_TOKEN 유출 표면 확대)"
+    )
+
+
 def test_review_pr_command_exists_and_names_all_agents():
     cmd = CONFIG / "commands" / "review-pr.md"
     assert (

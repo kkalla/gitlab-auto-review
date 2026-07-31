@@ -1,7 +1,7 @@
 ---
 description: "Comprehensive PR review using specialized agents"
 argument-hint: "[review-aspects]"
-allowed-tools: ["Bash", "Glob", "Grep", "Read", "Task"]
+allowed-tools: ["Bash(git:*)", "Glob", "Grep", "Read", "Task"]
 ---
 
 # Comprehensive PR Review
