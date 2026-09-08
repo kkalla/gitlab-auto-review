@@ -134,6 +134,18 @@ def test_dockerfile_pins_claude_version():
     )
 
 
+def test_claude_invocation_pins_model():
+    """CLI 버전 핀과 짝을 이루는 모델 핀. 미지정이면 계정 기본 모델을 따라가
+    재배포·계정 정책 변경 한 번에 리뷰 톤이 조용히 바뀐다(2026-09-02 실제 발생)."""
+    source = (ROOT / "review_runner.py").read_text(encoding="utf-8")
+    assert re.search(r'^CLAUDE_MODEL = "[^"]+"', source, re.M), (
+        "CLAUDE_MODEL 상수가 없다 — 모델이 고정되지 않으면 계정 기본값을 따라간다"
+    )
+    assert '"--model",\n                CLAUDE_MODEL,' in source, (
+        "claude argv에 --model이 없다 — 상수만 있고 CLI에 전달되지 않는다"
+    )
+
+
 def test_dockerfile_bakes_claude_config():
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
     assert re.search(

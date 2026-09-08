@@ -107,6 +107,12 @@ RETRY_ATTEMPTS = 2
 # RCE 차단은 아니다 — CLAUDE_CODE_OAUTH_TOKEN을 strip할 수 없는 구조상 이 스코핑이 1차 방어선이다.
 ALLOWED_TOOLS = "Read,Glob,Grep,Bash(git:*),Task"
 
+# 모델 핀 필수 — 미지정이면 계정 기본 모델을 따라가고, 재배포나 계정 정책 변경
+# 한 번에 리뷰 톤·구조가 조용히 바뀐다(2026-09-02 재배포 후 실제 발생). Dockerfile이
+# CLI 버전(@2.1.220)을 핀하는 것과 같은 이유이며, 그 핀만으로는 모델이 안 잡힌다.
+# 별칭이라 "최신 opus"를 따라간다 — 특정 스냅샷 고정이 필요하면 전체 모델 ID를 쓴다.
+CLAUDE_MODEL = "opus"
+
 # claude 서브프로세스에서 가릴 비밀 env. 명시 키 + 비밀스러운 접미사를 차단하는
 # fail-secure denylist — .env에 새 *_TOKEN/_SECRET/_KEY가 추가돼도 수동 갱신 없이
 # 자동으로 가려진다. CLAUDE_CODE_OAUTH_TOKEN만 claude 인증에 필요해 예외로 통과한다.
@@ -951,6 +957,35 @@ def run_claude_review(
         "'모든 에이전트 완료'·'최종 리뷰 작성할게' 같은 진행 상황·메타 서술은 넣지 말고 "
         "리뷰 본문만 작성해.\n"
         "\n"
+        "출력 구조 — 아래 형식을 그대로 따를 것:\n"
+        "\n"
+        "```\n"
+        "## 🤖 리뷰 요약\n"
+        "\n"
+        "| 심각도 | 건수 |\n"
+        "|---|---|\n"
+        "| 🔴 Critical | N |\n"
+        "| 🟡 Important | N |\n"
+        "| 🔵 Advisory | N |\n"
+        "\n"
+        "### 🔴 Critical\n"
+        "- `경로:줄번호` — 무엇이 왜 문제인지. → 조치 제안.\n"
+        "\n"
+        "### 🟡 Important\n"
+        "### 🔵 Advisory\n"
+        "\n"
+        "### 확인했고 문제 없던 것\n"
+        "- 실제로 코드를 열어 확인한 항목만. 근거를 함께.\n"
+        "\n"
+        "**결론**: 머지 가능 여부와 그 근거 1~2문장.\n"
+        "```\n"
+        "\n"
+        "지적 항목에는 **반드시 `경로:줄번호` 앵커**를 붙인다. 심각도 기준은 "
+        "🔴 Critical = 데이터 손실·보안·명백한 버그(머지 차단), 🟡 Important = 고쳐야 할 "
+        "결함이나 누락, 🔵 Advisory = 유지보수성 제안. 해당 건이 없는 심각도 섹션은 "
+        "생략하되 요약 표에는 0으로 남긴다. 추측이 아니라 **코드를 직접 열어 확인한 것만** "
+        "쓰고, 확인하지 못한 것(로컬 재현 불가한 실측치 등)은 그렇다고 명시한다.\n"
+        "\n"
         "활용 가능한 도구:\n"
         f"{diff_hint}"
         "- `git show <sha>` — 특정 커밋 상세\n"
@@ -987,8 +1022,9 @@ def run_claude_review(
     # stdout/stderr 모두 PIPE로 캡처 — stderr는 실패 알림 코멘트의 재료가 되고,
     # 캡처 후 logger로 재출력해 docker logs 가시성도 유지한다.
     logger.info(
-        "claude 호출 시작 (timeout=%ds, allowed-tools=%s)",
+        "claude 호출 시작 (timeout=%ds, model=%s, allowed-tools=%s)",
         CLAUDE_TIMEOUT_SEC,
+        CLAUDE_MODEL,
         ALLOWED_TOOLS,
     )
     try:
@@ -996,6 +1032,8 @@ def run_claude_review(
             [
                 "claude",
                 "-p",
+                "--model",
+                CLAUDE_MODEL,
                 "--allowed-tools",
                 ALLOWED_TOOLS,
                 "--add-dir",
