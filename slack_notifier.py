@@ -33,6 +33,22 @@ _MR_URL_RE = re.compile(
 )
 
 
+# intent 리뷰(사람 검토) 대상 문서 경로. agentic-ocr-impl docs/agents/workflow.md §2·§3 —
+# intent(docs/intents/)와 ADR(…/decisions/ADR-*)만 바뀐 MR은 Draft 단계의 문서 검토다.
+_INTENT_PATH_RE = re.compile(r"^docs/intents/|/decisions/ADR-[^/]+$")
+
+
+def classify_review_type(paths: list[str]) -> str | None:
+    """MR 변경 파일 경로로 리뷰 유형 판별: "intent" | "code", 파일이 없으면 None.
+
+    전부 intent·ADR 문서면 "intent", 하나라도 다른 파일이 섞이면 "code".
+    intent 검토 뒤 같은 브랜치에서 구현으로 넘어가므로 push마다 다시 판별해야 한다.
+    """
+    if not paths:
+        return None
+    return "intent" if all(_INTENT_PATH_RE.search(p) for p in paths) else "code"
+
+
 def enabled() -> bool:
     """Slack 전송이 가능한 상태인지(봇 토큰 존재) 여부."""
     return bool(SLACK_BOT_TOKEN)
@@ -128,14 +144,18 @@ def _open_dm_channel(user_id: str) -> str | None:
     return None
 
 
-def send_dm(user_id: str, text: str) -> bool:
+def send_dm(user_id: str, text: str, blocks: list[dict] | None = None) -> bool:
     """user_id에게 DM 전송. 성공 여부 반환 (best-effort, 예외 없음).
 
     text는 Slack mrkdwn으로 렌더된다 — `<url|라벨>` 링크 문법 사용 가능.
+    blocks를 주면 본문은 blocks로 렌더되고 text는 알림 미리보기 fallback이 된다.
     """
     if not user_id or not enabled():
         return False
     channel = _open_dm_channel(user_id)
     if not channel:
         return False
-    return bool(_post("chat.postMessage", {"channel": channel, "text": text}).get("ok"))
+    payload: dict[str, Any] = {"channel": channel, "text": text}
+    if blocks:
+        payload["blocks"] = blocks
+    return bool(_post("chat.postMessage", payload).get("ok"))

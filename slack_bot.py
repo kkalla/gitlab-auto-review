@@ -4,13 +4,11 @@
 공개 inbound 포트·URL·리버스 프록시가 필요 없다 — 봇이 Slack으로 아웃바운드
 WebSocket을 직접 연다(방화벽/NAT 무관).
 
-트리거 3종:
-    1. @멘션(수동)            — app_mention 이벤트, MR URL을 함께 멘션
-    2. GitLab 채널 알림(자동)  — message 이벤트, GitLab Slack notification이 뿌린
-                                 MR 링크를 잡는다(주로 MR open 시)
-    3. 주기 폴링(자동, push 증분) — GitLab Slack 알림은 MR push를 채널에 안 띄우므로,
-                                 봇이 직접 리뷰어 지정 열린 MR의 source SHA를 주기적으로
-                                 확인해 변경분(새 push)을 리뷰한다
+트리거 2종:
+    1. @멘션(수동)        — app_mention 이벤트, MR URL을 함께 멘션하면 바로 리뷰
+    2. 리뷰 요청 DM + 버튼 — 폴러가 리뷰어 지정 열린 MR의 신규 지정·새 push를 감지하면
+                             리뷰어에게 DM(MR 링크 + intent/코드 리뷰 안내 + 「코드 리뷰하기」
+                             버튼)을 보낸다. 리뷰는 버튼을 눌러야 돈다(자동 실행 안 함)
 
 Notion 조회 슬래시 커맨드(/task-status·/project-status)는 96_ags-watchtower로
 분리됐다 — 이 봇은 MR 리뷰 전용이다.
@@ -28,6 +26,7 @@ review_runner는 별도 프로세스로 실행한다 — claude가 타임아웃�
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import subprocess
@@ -68,13 +67,17 @@ SLACK_APP_TOKEN = _required_env("SLACK_APP_TOKEN")
 GITLAB_URL = _required_env("GITLAB_URL").rstrip("/")
 GITLAB_TOKEN = _required_env("GITLAB_TOKEN")
 
-# 폴링 자동 증분 리뷰. GitLab Slack 알림은 MR push(새 커밋)를 채널에 안 띄우므로
-# message 자동 트리거로는 push 증분을 못 잡는다 → 봇이 직접 GitLab API로 리뷰어 지정
-# 열린 MR의 source SHA를 POLL_INTERVAL_SEC마다 확인해 변경분을 리뷰한다.
+# 리뷰 요청 폴링. 봇이 GitLab API로 리뷰어 지정 열린 MR의 source SHA를
+# POLL_INTERVAL_SEC마다 확인해 신규 지정·새 push를 리뷰어에게 DM으로 알린다.
 #   REVIEWER_USERNAME: 폴링 대상 MR 필터(reviewer_username). 실패 알림 @멘션과 동일 값.
-#   POLL_INTERVAL_SEC: 폴링 간격(초). 0이면 폴러 비활성화(@멘션·채널 알림만).
+#   POLL_INTERVAL_SEC: 폴링 간격(초). 0이면 폴러 비활성화(@멘션만).
 REVIEWER_USERNAME = os.environ.get("REVIEWER_USERNAME", "max").strip()
 POLL_INTERVAL_SEC = int(os.environ.get("POLL_INTERVAL_SEC", "300"))
+# 리뷰 요청 DM 수신자이자 「코드 리뷰하기」 버튼을 누를 수 있는 유일한 사용자.
+# 비면 폴러를 띄우지 않는다(DM 보낼 곳이 없음).
+REVIEWER_SLACK_ID = os.environ.get("REVIEWER_SLACK_ID", "").strip()
+
+REVIEW_ACTION_ID = "run_code_review"
 
 # review_runner 서브프로세스 외곽 가드. review_runner 내부 worst-case(~2040s)보다
 # 커야 자체 타임아웃 처리/실패 알림이 가능하다. webhook_server.py와 동일 값.
@@ -129,28 +132,6 @@ def _parse_mention(text: str) -> tuple[int, int, str] | None:
         return None
     web_url = f"{GITLAB_URL}/{project_path}/-/merge_requests/{mr_iid}"
     return project_id, mr_iid, web_url
-
-
-def _mr_is_opened(project_id: int, mr_iid: int) -> bool:
-    """MR이 열린 상태인지. 조회 실패 시 True(보수적 진행 — review_runner가 최종 방어).
-
-    GitLab Slack notification은 MR close/merge에도 채널 알림을 보내므로, 자동
-    트리거(message)가 닫히거나 병합된 MR을 리뷰하지 않도록 state를 확인한다.
-    """
-    try:
-        resp = httpx.get(
-            f"{GITLAB_URL}/api/v4/projects/{project_id}/merge_requests/{mr_iid}",
-            headers={"PRIVATE-TOKEN": GITLAB_TOKEN},
-            timeout=30.0,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception:
-        logger.exception(
-            "MR state 조회 실패 (project=%s mr=%s) — 트리거 진행", project_id, mr_iid
-        )
-        return True
-    return isinstance(data, dict) and data.get("state") == "opened"
 
 
 def _post(channel: str | None, thread_ts: str | None, text: str) -> None:
@@ -241,10 +222,9 @@ def _dispatch_review(
 ) -> bool:
     """in-flight 가드 통과 시 (있으면) ack 답글 + 리뷰 스레드 시작. 이미 진행 중이면 False.
 
-    세 경로가 공유한다: app_mention(수동)·message(GitLab 자동)·폴러(push 증분).
-    같은 MR이 여러 경로로 동시에 들어와도 먼저 잡은 쪽만 실행된다. 폴러는 channel/say
-    없이 호출하므로 ack·스레드 답글 없이 조용히 돌고, 결과는 review_runner가 MR 코멘트
-    + 리뷰어/assignee DM으로 알린다.
+    두 경로가 공유한다: app_mention(수동)·DM 「코드 리뷰하기」 버튼. 같은 MR이 동시에
+    들어와도 먼저 잡은 쪽만 실행된다. 결과는 channel/thread_ts 스레드 답글 + review_runner의
+    MR 코멘트·리뷰어/assignee DM으로 알린다.
     """
     key = (project_id, mr_iid)
     with _inflight_lock:
@@ -263,23 +243,6 @@ def _dispatch_review(
         daemon=True,
     ).start()
     return True
-
-
-def _extract_text(event: dict) -> str:
-    """이벤트 본문 + attachments에서 텍스트를 모은다.
-
-    GitLab의 Slack notification(incoming webhook)은 MR 링크를 `text`가 아니라
-    `attachments`(fallback/text/title_link 등)에 넣는다. 자동 트리거가 그 링크를
-    잡으려면 attachments까지 훑어야 한다.
-    """
-    parts = [event.get("text", "")]
-    for att in event.get("attachments") or []:
-        if isinstance(att, dict):
-            parts += [
-                str(att.get(k, ""))
-                for k in ("fallback", "text", "pretext", "title", "title_link")
-            ]
-    return "\n".join(p for p in parts if p)
 
 
 @app.event("app_mention")
@@ -309,31 +272,104 @@ def handle_mention(event: dict, say) -> None:
         )
 
 
-@app.event("message")
-def handle_channel_message(event: dict, say) -> None:
-    """채널 메시지 자동 트리거. GitLab Slack notification이 뿌린 MR 링크를 잡는다.
+@app.action(REVIEW_ACTION_ID)
+def handle_review_button(ack, body: dict, client) -> None:
+    """리뷰 요청 DM의 「코드 리뷰하기」 버튼. 기존 자동 리뷰를 돌려 MR에 코멘트를 남긴다."""
+    ack()
+    # DM은 REVIEWER_SLACK_ID에게만 가지만, 버튼 payload는 누른 사람 기준으로 다시 확인한다.
+    if (body.get("user") or {}).get("id") != REVIEWER_SLACK_ID:
+        logger.warning("리뷰 버튼: 허용되지 않은 사용자 클릭 무시 (%s)", body.get("user"))
+        return
+    try:
+        target = json.loads(body["actions"][0]["value"])
+        project_id, mr_iid, web_url = int(target["p"]), int(target["i"]), str(target["u"])
+        channel = body["channel"]["id"]
+        message = body["message"]
+    except (KeyError, IndexError, TypeError, ValueError):
+        logger.exception("리뷰 버튼 payload 해석 실패")
+        return
 
-    GitLab 프로젝트의 Slack integration(Merge request events)을 켜고 봇이 그 채널에
-    들어가 있으면, MR이 열릴 때마다 멘션 없이 자동으로 리뷰가 돈다. MR URL이 없는
-    일반 대화는 조용히 무시한다. 봇 자신의 메시지(ack·결과 답글)는 Bolt 기본
-    ignoring_self_events 미들웨어가 걸러 무한 트리거가 생기지 않는다.
+    ts = message["ts"]
+    started = _dispatch_review(project_id, mr_iid, web_url, channel, ts)
+    note = (
+        f"🔍 코드 리뷰를 시작했어요 (MR !{mr_iid}). 결과는 이 스레드로 알려 드려요."
+        if started
+        else f"이미 MR !{mr_iid} 리뷰가 진행 중이에요."
+    )
+    # 버튼을 지워 같은 DM에서 재클릭을 막는다(새 push가 오면 새 DM에 새 버튼이 붙는다).
+    blocks = [b for b in message.get("blocks", []) if b.get("type") != "actions"]
+    blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": note}]})
+    try:
+        client.chat_update(channel=channel, ts=ts, text=message.get("text", ""), blocks=blocks)
+    except Exception:
+        logger.exception("리뷰 버튼: DM 갱신 실패")
+
+
+def _fetch_changed_paths(project_id: int, mr_iid: int) -> list[str]:
+    """MR 변경 파일 경로 목록. 실패 시 빈 리스트(→ 리뷰 유형 판별 불가).
+
+    `/diffs`(GitLab 15.7+)를 먼저, 404면 구버전용 `/changes`로 재시도한다.
     """
-    # 편집/삭제/채널 조인 등은 무시. 일반 메시지(None)와 봇 메시지(bot_message)만 본다.
-    if event.get("subtype") not in (None, "bot_message"):
-        return
+    base = f"{GITLAB_URL}/api/v4/projects/{project_id}/merge_requests/{mr_iid}"
+    for endpoint in ("diffs", "changes"):
+        try:
+            resp = httpx.get(
+                f"{base}/{endpoint}",
+                headers={"PRIVATE-TOKEN": GITLAB_TOKEN},
+                params={"per_page": 100},
+                timeout=30.0,
+            )
+            if resp.status_code == 404 and endpoint == "diffs":
+                continue
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception:
+            logger.exception("MR 변경 파일 조회 실패 (project=%s mr=%s)", project_id, mr_iid)
+            return []
+        files = data.get("changes", []) if isinstance(data, dict) else data
+        return [f.get("new_path") or f.get("old_path") or "" for f in files if isinstance(f, dict)]
+    return []
 
-    parsed = _parse_mention(_extract_text(event))
-    if parsed is None:
-        return  # MR 링크 없는 메시지 — 조용히 무시
 
-    project_id, mr_iid, web_url = parsed
-    # GitLab은 MR close/merge에도 채널 알림을 보낸다 — 자동 트리거는 열린 MR만 리뷰한다.
-    if not _mr_is_opened(project_id, mr_iid):
-        logger.info("skip: 채널 트리거 — MR !%s가 열린 상태가 아님", mr_iid)
-        return
-    channel = event.get("channel", "")
-    thread_ts = event.get("thread_ts") or event.get("ts")
-    _dispatch_review(project_id, mr_iid, web_url, channel, thread_ts, say)
+def _escape_mrkdwn(text: str) -> str:
+    """Slack mrkdwn 제어 문자 이스케이프 — MR 제목이 링크 문법을 깨지 않게."""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("|", "¦")
+
+
+_REVIEW_TYPE_GUIDE = {
+    "intent": (
+        "📝 *Intent 리뷰* 요청이에요. intent·ADR 문서만 바뀐 MR이라 문서를 직접 읽고 "
+        "MR 코멘트로 답해 주세요. 코드 리뷰가 필요하면 아래 버튼을 눌러도 돼요."
+    ),
+    "code": "💻 *코드 리뷰* 요청이에요. 아래 버튼을 누르면 AI 자동 리뷰를 돌려 MR에 코멘트를 남겨요.",
+    None: "❔ 리뷰 유형을 판별하지 못했어요(변경 파일 조회 실패). MR에서 직접 확인해 주세요.",
+}
+
+
+def _notify_review_request(mr: dict, reason: str) -> None:
+    """리뷰어에게 리뷰 요청 DM — MR 링크 + intent/코드 리뷰 안내 + 「코드 리뷰하기」 버튼."""
+    project_id, mr_iid, web_url = mr["project_id"], mr["iid"], mr.get("web_url", "")
+    review_type = slack_notifier.classify_review_type(_fetch_changed_paths(project_id, mr_iid))
+    title = _escape_mrkdwn(str(mr.get("title", ""))[:200])
+    guide = _REVIEW_TYPE_GUIDE[review_type]
+    text = f"🔔 리뷰 요청 — <{web_url}|MR !{mr_iid}> {title}"
+    blocks = [
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"{text}\n_{reason}_\n\n{guide}"}},
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "action_id": REVIEW_ACTION_ID,
+                    "text": {"type": "plain_text", "text": "코드 리뷰하기"},
+                    "style": "primary",
+                    "value": json.dumps({"p": project_id, "i": mr_iid, "u": web_url}),
+                }
+            ],
+        },
+    ]
+    if not slack_notifier.send_dm(REVIEWER_SLACK_ID, text, blocks):
+        logger.warning("리뷰 요청 DM 전송 실패 (MR !%s)", mr_iid)
 
 
 def _fetch_open_reviewer_mrs() -> list[dict]:
@@ -363,18 +399,19 @@ def _fetch_open_reviewer_mrs() -> list[dict]:
 
 
 def _poll_loop() -> None:
-    """주기적으로 리뷰어 지정 열린 MR을 폴링해 새로 열린 MR과 새 push를 자동 리뷰한다.
+    """주기적으로 리뷰어 지정 열린 MR을 폴링해 신규 지정·새 push를 리뷰어에게 DM으로 알린다.
 
-    GitLab Slack 알림은 MR push를 채널에 안 띄우므로(message 자동 트리거 불가) 폴링으로
-    보완한다. 첫 순회는 baseline만 잡고(봇 기동 시 기존 MR 일괄 리뷰 방지) 이후 **기동 후
-    새로 열린 MR**(seen에 없던 것)과 **source SHA가 바뀐 MR**(새 push)을 트리거한다. 실제
-    증분/스킵 판단(새 커밋 0개면 스킵)은 review_runner의 reviewed-sha 마커가 처리하므로,
-    폴러는 "신규/변경 감지 → 호출"만 담당한다.
+    첫 순회는 baseline만 잡고(봇 기동 시 기존 MR 일괄 DM 방지) 이후 **새로 리뷰어로
+    지정된 MR**(seen에 없던 것)과 **source SHA가 바뀐 MR**(새 push)마다 DM을 보낸다.
+    리뷰 실행은 DM 버튼이 맡는다 — 증분/스킵 판단은 review_runner의 reviewed-sha 마커.
+    push마다 리뷰 유형을 다시 판별한다 — intent 검토 뒤 같은 MR에 구현이 올라오기 때문.
 
-    트레이드오프: 봇 재시작 시 seen 캐시가 비어 그 사이 들어온 push는 baseline에 흡수돼
-    한 번 놓칠 수 있다(수동 @멘션으로 커버). in-flight 가드로 멘션과의 중복은 막힌다.
+    트레이드오프: 봇 재시작 시 seen 캐시가 비어 그 사이 지정·push는 baseline에 흡수돼
+    한 번 놓칠 수 있다(수동 @멘션으로 커버).
     """
-    seen: dict[int, str] = {}  # mr_iid -> 마지막으로 본 source SHA
+    # iid는 프로젝트별 번호라 단독 키로 쓰면 다른 프로젝트의 같은 번호 MR끼리 SHA를 덮어써
+    # 매 순회 "새 push"로 오인한다 → (project_id, iid)로 키를 잡는다.
+    seen: dict[tuple[int, int], str] = {}  # (project_id, iid) -> 마지막으로 본 source SHA
     first = True
     while True:
         try:
@@ -382,18 +419,17 @@ def _poll_loop() -> None:
                 iid = mr.get("iid")
                 sha = mr.get("sha")
                 pid = mr.get("project_id")
-                web_url = mr.get("web_url", "")
                 if not isinstance(iid, int) or not isinstance(pid, int) or not sha:
                     continue
-                prev = seen.get(iid)
-                seen[iid] = sha
+                prev = seen.get((pid, iid))
+                seen[(pid, iid)] = sha
                 if first or prev == sha:
                     continue  # baseline(기동 시 기존 MR)이거나 변경 없음
-                # prev is None → 기동 후 새로 열린 MR(open 자동 리뷰)
+                # prev is None → 기동 후 새로 리뷰어로 지정된 MR
                 # prev != sha  → 기존 MR에 새 push(증분)
-                change = f"{prev[:8]}→{sha[:8]}" if prev else f"신규 open {sha[:8]}"
-                logger.info("폴링: MR !%s %s → 리뷰 트리거", iid, change)
-                _dispatch_review(pid, iid, web_url)
+                reason = f"새 push {prev[:8]}→{sha[:8]}" if prev else "리뷰어로 지정됨"
+                logger.info("폴링: MR !%s %s → 리뷰 요청 DM", iid, reason)
+                _notify_review_request(mr, reason)
             first = False
         except Exception:
             logger.exception("폴링 루프 오류")
@@ -405,9 +441,11 @@ def main() -> None:
         logger.warning(
             "SLACK_BOT_TOKEN이 slack_notifier에 보이지 않음 — 리뷰어/assignee DM이 비활성화됩니다."
         )
-    if POLL_INTERVAL_SEC > 0:
+    if POLL_INTERVAL_SEC > 0 and not REVIEWER_SLACK_ID:
+        logger.warning("REVIEWER_SLACK_ID 비어 있음 — 리뷰 요청 DM 폴러를 띄우지 않습니다.")
+    elif POLL_INTERVAL_SEC > 0:
         logger.info(
-            "MR 폴러 시작 — %s초 간격, 리뷰어=%s (push 증분 자동 리뷰)",
+            "MR 폴러 시작 — %s초 간격, 리뷰어=%s (신규 지정·push → 리뷰 요청 DM)",
             POLL_INTERVAL_SEC,
             REVIEWER_USERNAME,
         )

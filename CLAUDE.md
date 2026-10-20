@@ -71,21 +71,23 @@ Review is **clone-based**: `review_runner.py` shallow-clones the repo into a tem
 `review_runner.py`는 두 트리거가 공유한다. **하나의 컨테이너 이미지, 두 진입점:**
 
 1. **`webhook_server.py`** (webhook 모드) — GitLab MR webhook을 공개 HTTP로 받음. `WEBHOOK_SECRET` 필요, `ports: 8080` 노출.
-2. **`slack_bot.py`** (Slack 봇 모드, **기본 CMD**) — Slack Socket Mode 봇. **공개 inbound 포트 불필요** — 봇이 Slack으로 아웃바운드 WebSocket을 연다(방화벽/NAT 무관). 트리거 **세 가지**: **자동·채널알림**(GitLab Slack notification이 뿌린 MR 링크를 `message` 이벤트로 잡음 — 주로 MR open) / **자동·폴링**(봇이 `POLL_INTERVAL_SEC`마다 reviewer 지정 열린 MR의 source SHA를 확인해 변경분을 리뷰 — **push 증분의 길**; GitLab Slack 알림은 MR push를 채널에 안 띄우므로 필요) / **수동·멘션**(`@ags-watchtower <MR URL>`). 설정은 `SLACK_SETUP.md`.
+2. **`slack_bot.py`** (Slack 봇 모드, **기본 CMD**) — Slack Socket Mode 봇. **공개 inbound 포트 불필요** — 봇이 Slack으로 아웃바운드 WebSocket을 연다(방화벽/NAT 무관). 트리거 **두 가지**: **리뷰 요청 DM + 버튼**(폴러가 `POLL_INTERVAL_SEC`마다 reviewer 지정 열린 MR을 확인해 신규 지정·새 push마다 리뷰어에게 DM — MR 링크 + Intent/코드 리뷰 안내 + 「코드 리뷰하기」 버튼. **리뷰는 버튼을 눌러야 돈다**) / **수동·멘션**(`@ags-watchtower <MR URL>`, 즉시 리뷰). GitLab 채널 알림 자동 리뷰 트리거는 2026-10-20 제거. 설정은 `SLACK_SETUP.md`.
 
 ```
-(자동·채널) GitLab 알림 → 채널 message → slack_bot.py (handle_channel_message)
-(자동·폴링) POLL_INTERVAL_SEC마다 GET /merge_requests?reviewer_username=… → SHA 변경분 (_poll_loop)
-(수동·멘션) @봇 <MR URL> → slack_bot.py (app_mention)
-                 ├─ MR URL/목록에서 project_id·mr_iid 해석
-                 ├─ (멘션/채널만) 스레드 ack 답글
+(DM)   POLL_INTERVAL_SEC마다 GET /merge_requests?reviewer_username=… → 신규 지정·SHA 변경 (_poll_loop)
+         → GET …/diffs 로 intent/코드 판별 → 리뷰어 DM (_notify_review_request)
+         → 「코드 리뷰하기」 클릭 (handle_review_button)
+(멘션) @봇 <MR URL> → slack_bot.py (app_mention)
+                 ├─ project_id·mr_iid 해석 → _dispatch_review
+                 ├─ 스레드 ack 답글 (멘션은 채널 스레드, 버튼은 DM 스레드)
                  └─ subprocess ──> review_runner.py <project_id> <mr_iid>
                                      └─ (기존 파이프라인) + 완료/실패 시 Slack DM
 ```
 
 - `slack_bot.py`는 `webhook_server.py`와 같은 격리 원칙: review_runner를 **subprocess**로 띄워 claude 타임아웃 SIGKILL/크래시가 봇 WebSocket을 죽이지 못하게 한다. 리뷰는 Bolt 핸들러/폴러를 막지 않도록 별도 `threading.Thread`에서 실행.
-- 세 트리거는 `_dispatch_review()`를 공유하고 `(project_id, mr_iid)` in-flight 가드로 중복을 막는다 — 멘션 메시지는 `app_mention`·`message` 둘 다 발생하지만 먼저 잡은 쪽만 실행된다. 봇 자신의 답글이 `message`로 되돌아와 재트리거되는 것은 Bolt 기본 `ignoring_self_events`가 막는다.
-- **폴러**(`_poll_loop`, 데몬 스레드)는 첫 순회를 **baseline**으로 잡고(봇 기동 시 기존 MR 일괄 리뷰 방지) 이후 source SHA가 바뀐 MR만 트리거한다. 폴링 트리거는 `channel`/`say` 없이 `_dispatch_review`를 호출해 **스레드 답글 없이 조용히** 돌고(결과는 review_runner의 MR 코멘트 + DM), `_post`는 `channel`이 없으면 no-op이다. `POLL_INTERVAL_SEC=0`이면 폴러 비활성화. 봇 재시작 시 baseline이 비어 그 사이 push는 한 번 놓칠 수 있다(수동 멘션으로 커버).
+- 멘션·버튼은 `_dispatch_review()`를 공유하고 `(project_id, mr_iid)` in-flight 가드로 중복을 막는다. 버튼은 `REVIEWER_SLACK_ID` 본인 클릭만 받고, 누르면 DM에서 버튼을 지워(`chat.update`) 재클릭을 막는다.
+- **폴러**(`_poll_loop`, 데몬 스레드)는 첫 순회를 **baseline**으로 잡고(봇 기동 시 기존 MR 일괄 DM 방지) 이후 신규 지정·source SHA 변경 MR마다 DM한다. `seen` 키는 `(project_id, iid)` — iid는 프로젝트별 번호라 단독 키면 다른 프로젝트 MR끼리 SHA를 덮어써 매 순회 오탐한다. `POLL_INTERVAL_SEC=0` 또는 `REVIEWER_SLACK_ID` 미설정이면 폴러 비활성화. 봇 재시작 시 baseline이 비어 그 사이 지정·push는 한 번 놓칠 수 있다(수동 멘션으로 커버).
+- **리뷰 유형 판별**(`slack_notifier.classify_review_type`): 변경 파일이 전부 `docs/intents/` 또는 `…/decisions/ADR-*`이면 intent, 하나라도 섞이면 code (agentic-ocr-impl `docs/agents/workflow.md` §2·§3 기준). intent 검토 뒤 같은 브랜치에서 구현으로 넘어가므로 push마다 다시 판별한다. 폴러는 reviewer 지정만 본다 — 코멘트 @멘션으로만 요청한 intent 검토는 잡지 못한다.
 - 봇은 oldrev를 넘기지 않는다 — 증분 리뷰는 review_runner가 MR 코멘트의 `reviewed-sha` 마커로 자체 처리하므로 `@멘션` 수동 트리거에서도 정상 동작한다.
 - `slack_bot.py`만 `slack_bolt`에 의존한다. `review_runner.py`/`slack_notifier.py`는 `httpx`만 쓴다 — review_runner의 테스트 의존성을 가볍게 유지하기 위함(테스트는 `slack_bolt` 미설치로도 통과).
 
@@ -177,10 +179,10 @@ webhook 모드 (`webhook_server.py`):
 - `WEBHOOK_SECRET` — must match GitLab webhook Secret Token. (Slack 봇 모드에선 불필요.)
 
 Slack 봇 모드 (`slack_bot.py`):
-- `SLACK_BOT_TOKEN` (`xoxb-…`) — bot 토큰. 스코프 `chat:write, app_mentions:read, users:read, users:read.email, im:write`. 봇 부팅 필수이며, `review_runner.py`에선 **선택**(없으면 DM 알림만 no-op).
+- `SLACK_BOT_TOKEN` (`xoxb-…`) — bot 토큰. 스코프 `chat:write, app_mentions:read, users:read, users:read.email, im:write`. 버튼 때문에 앱 manifest의 `interactivity`가 켜져 있어야 한다. 봇 부팅 필수이며, `review_runner.py`에선 **선택**(없으면 DM 알림만 no-op).
 - `SLACK_APP_TOKEN` (`xapp-…`) — App-Level 토큰, `connections:write`. Socket Mode 전용. 봇 부팅 필수.
-- `REVIEWER_SLACK_ID` (`U…`) — 완료/실패 DM을 받을 리뷰어 member ID. 선택 — 비면 리뷰어 DM 생략(assignee DM은 이메일 매핑으로 별도).
-- `POLL_INTERVAL_SEC` (default 300) — 폴러 주기(초). reviewer 지정 열린 MR의 source SHA를 이 주기로 확인해 push 증분을 자동 리뷰한다. `0`이면 폴러 비활성화(채널알림·멘션만). slack_bot 전용.
+- `REVIEWER_SLACK_ID` (`U…`) — 리뷰 요청·완료/실패 DM을 받을 리뷰어 member ID이자 「코드 리뷰하기」 버튼 허용 사용자. 비면 리뷰 요청 DM 폴러가 뜨지 않고 리뷰어 DM도 생략(assignee DM은 이메일 매핑으로 별도).
+- `POLL_INTERVAL_SEC` (default 300) — 폴러 주기(초). reviewer 지정 열린 MR을 이 주기로 확인해 신규 지정·새 push를 리뷰 요청 DM으로 알린다. `0`이면 폴러 비활성화(멘션만). slack_bot 전용.
 
 ## Conventions
 

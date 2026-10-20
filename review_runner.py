@@ -1183,9 +1183,9 @@ def main(project_id: int, mr_iid: int, oldrev: str | None = None) -> int:
         )
         return 1
 
-    # 닫히거나 병합된 MR은 리뷰 대상이 아니다 — GitLab Slack notification은 MR
-    # close/merge에도 채널 알림을 보내므로 봇 message 트리거가 닫힌 MR을 부를 수 있고,
-    # 브랜치가 이미 삭제됐으면 clone도 실패한다. 실패가 아니므로 알림 없이 스킵.
+    # 닫히거나 병합된 MR은 리뷰 대상이 아니다 — 리뷰 요청 DM 버튼은 MR이 닫힌 뒤에도
+    # 눌릴 수 있고(멘션도 마찬가지), 브랜치가 이미 삭제됐으면 clone도 실패한다.
+    # 실패가 아니므로 알림 없이 스킵.
     state = mr.get("state")
     if state != "opened":
         logger.info("skip: MR state=%s — 열린 MR만 리뷰", state)
