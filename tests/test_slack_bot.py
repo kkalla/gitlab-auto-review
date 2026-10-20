@@ -122,6 +122,19 @@ def test_fetch_changed_paths_truncated_returns_empty():
         assert sb._fetch_changed_paths(1, 5) == []
 
 
+def test_fetch_changed_paths_diffs_request_omits_per_page():
+    # 사내 GitLab은 /diffs에 per_page>20을 주면 500을 낸다(2026-10-20 E2E 실측) → 기본값에 맡긴다.
+    with patch.object(sb.httpx, "get", return_value=_resp([{"new_path": "a.py"}])) as get:
+        assert sb._fetch_changed_paths(1, 5) == ["a.py"]
+    assert "per_page" not in get.call_args.kwargs["params"]
+
+
+def test_fetch_changed_paths_falls_back_to_changes_on_server_error():
+    responses = [_resp({}, status=500), _resp({"changes": [{"new_path": "a.py"}]})]
+    with patch.object(sb.httpx, "get", side_effect=responses):
+        assert sb._fetch_changed_paths(1, 5) == ["a.py"]
+
+
 def test_fetch_changed_paths_falls_back_to_changes_on_404():
     responses = [_resp({}, status=404), _resp({"changes": [{"new_path": "a.py"}]})]
     with patch.object(sb.httpx, "get", side_effect=responses):

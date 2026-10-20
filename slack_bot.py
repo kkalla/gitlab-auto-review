@@ -308,23 +308,25 @@ def handle_review_button(ack, body: dict, client) -> None:
         logger.exception("리뷰 버튼: DM 갱신 실패")
 
 
-# 페이지네이션 상한 (per_page=100 → 최대 2000건). 넘으면 일부만 본 결과로 판단하지
+# 페이지네이션 상한 (per_page=100이면 2000건, 기본 20이면 400건). 넘으면 일부만 본 결과로 판단하지
 # 않도록 None을 돌려 호출부가 "조회 불가"로 다루게 한다.
 _MAX_GITLAB_PAGES = 20
 
 
-def _gitlab_get_all(url: str, params: dict) -> list | None:
+def _gitlab_get_all(url: str, params: dict, per_page: int | None = 100) -> list | None:
     """GitLab 목록 API를 X-Next-Page를 따라 끝까지 읽는다. 상한 초과·비목록 응답이면 None.
 
-    HTTP 오류는 httpx.HTTPStatusError로 그대로 던진다(호출부가 404 폴백 등 판단).
+    per_page=None이면 GitLab 기본값(20)에 맡긴다. HTTP 오류는 httpx.HTTPStatusError로
+    그대로 던진다(호출부가 폴백 등 판단).
     """
+    size = {"per_page": per_page} if per_page else {}
     items: list = []
     page = "1"
     for _ in range(_MAX_GITLAB_PAGES):
         resp = httpx.get(
             url,
             headers={"PRIVATE-TOKEN": GITLAB_TOKEN},
-            params={**params, "per_page": 100, "page": page},
+            params={**params, **size, "page": page},
             timeout=30.0,
         )
         resp.raise_for_status()
@@ -342,15 +344,16 @@ def _gitlab_get_all(url: str, params: dict) -> list | None:
 def _fetch_changed_paths(project_id: int, mr_iid: int) -> list[str]:
     """MR 변경 파일 경로 목록. 실패·상한 초과 시 빈 리스트(→ 리뷰 유형 판별 불가).
 
-    `/diffs`(GitLab 15.7+)를 먼저, 404면 구버전용 `/changes`로 재시도한다.
+    `/diffs`(GitLab 15.7+)를 먼저, HTTP 오류면 `/changes`로 재시도한다 — 404(구버전)뿐 아니라
+    5xx도: 사내 GitLab은 `/diffs`에 per_page>20을 주면 500을 낸다(2026-10-20 E2E 실측).
+    그래서 `/diffs`는 per_page를 보내지 않고 기본값(20)으로 페이지를 넘긴다.
     """
     base = f"{GITLAB_URL}/api/v4/projects/{project_id}/merge_requests/{mr_iid}"
     try:
         try:
-            files = _gitlab_get_all(f"{base}/diffs", {})
+            files = _gitlab_get_all(f"{base}/diffs", {}, per_page=None)
         except httpx.HTTPStatusError as e:
-            if e.response.status_code != 404:
-                raise
+            logger.warning("MR /diffs 조회 HTTP %s — /changes로 재시도", e.response.status_code)
             resp = httpx.get(f"{base}/changes", headers={"PRIVATE-TOKEN": GITLAB_TOKEN}, timeout=30.0)
             resp.raise_for_status()
             data = resp.json()
