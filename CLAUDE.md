@@ -9,19 +9,22 @@ FastAPI service that receives GitLab MR webhooks and posts AI code review commen
 ## Run / debug
 
 ```bash
-# Production-like (Docker)
+# 배포 (196-server) — 태그 푸시 후 Jenkins가 3분 내 폴링해서 배포한다
+git tag v1.x.y && git push gitlab v1.x.y
+
+# 로그 (container_name이 고정이라 cwd 무관하게 동작)
+ssh 196-server 'docker logs -f gitlab-ai-reviewer'
+# docker compose down/재시작 등 compose 자체가 필요하면 Jenkins job의
+# 워크스페이스 디렉토리로 cd한 뒤 실행할 것 (ssh 'cmd'는 $HOME에서 시작함)
+
+# 로컬 이미지 검증 (서버 손대기 전) — claude-config/가 이미지에 제대로 구워졌는지 확인
+podman build -t reviewer-selfcontained:test . && \
+  podman run --rm reviewer-selfcontained:test sh -c \
+    'claude --version && ls /opt/reviewer-claude/commands /opt/reviewer-claude/agents'
+
+# 로컬 구동 (Docker/Podman 공통) — 호스트 마운트 없음, config는 이미지에 이미 구워져 있다
 docker compose up -d --build
 docker compose logs -f ai-reviewer
-
-# Production-like (Podman, macOS — 권장 타깃)
-# 1) Linux VM 준비 (최초 1회). claude+node+git이라 리소스는 넉넉히.
-podman machine init --cpus 4 --memory 4096   # 이미 있으면 생략
-podman machine start
-# 2) podman compose는 docker-compose/podman-compose 중 설치된 provider를 호출한다.
-podman compose up -d --build
-podman compose logs -f ai-reviewer
-# 마운트되는 ${HOME}/.claude-work·${HOME}/.claude는 호스트에서 세션이 한 번은
-# 만들어져 있어야 한다(설정/에이전트를 재사용). macOS엔 SELinux가 없어 `:z` 불필요.
 
 # Local Python (still requires env vars from .env)
 pip install -r requirements.txt
@@ -126,23 +129,25 @@ A webhook `update` fires on every push to the MR, so a re-review would otherwise
 
 ### Auth model — the load-bearing decision
 
-The container authenticates `claude` with a **long-lived OAuth token** (`CLAUDE_CODE_OAUTH_TOKEN`, from `claude setup-token` on the host) — a Claude **subscription** token, **not** `ANTHROPIC_API_KEY`. Why a token env var instead of just mounting the host session:
+The container authenticates `claude` with a **long-lived OAuth token** (`CLAUDE_CODE_OAUTH_TOKEN`, from `claude setup-token`) — a Claude **subscription** token, **not** `ANTHROPIC_API_KEY`.
 
-- **macOS Keychain isn't portable.** The host (macOS) stores its OAuth token in the Keychain, which the Linux container can't read. Mounting `~/.claude` / `~/.claude.json` carries config but **not** the token — `claude -p` then fails with `Not logged in`. `claude setup-token` prints a ~1-year token that bypasses Keychain; it flows `.env` → compose `env_file` → `review_runner`'s `claude_env` → the `claude` subprocess.
-- The container runs on the **work config dir**, `CLAUDE_CONFIG_DIR=/Users/max/.claude-work` (the host's `claude-work` alias is just `CLAUDE_CONFIG_DIR=~/.claude-work claude` — an alias, so there is no `claude-work` binary to exec; `review_runner.py` still invokes plain `claude`).
-- Both `~/.claude-work` and `~/.claude` are mounted **at their host absolute paths, not under `/root`**. `~/.claude-work/{agents,hooks,rules,CLAUDE.md,commands,scripts,statusline.sh}` are absolute symlinks into `/Users/max/.claude/`; mounting elsewhere leaves them dangling, and a missing `agents` silently collapses `/review-pr` to a single pass (its six subagents vanish). `settings.json` hook commands are absolute host paths too, for the same reason.
-- Both are mounted **read-write** (Bash tool writes `shell-snapshots/`; `.claude.json` rewrite and OAuth refresh need writes; `:ro` breaks with `EROFS`). Mounting the *directory* (not the single `.claude.json` file) also sidesteps the podman-virtiofs atomic-rename bug that used to require a `/seed` copy at entrypoint — that trick is gone.
-- If `claude -p` fails with `Not logged in`, the token is missing/expired — re-run `claude setup-token` on the host and update `CLAUDE_CODE_OAUTH_TOKEN` in `.env`. (The `/login` short-lived OAuth token dies in ~8h with no refresh; the `setup-token` long-lived token does not — use setup-token.)
-- `ANTHROPIC_API_KEY` stays intentionally absent — auth is the subscription OAuth token, not the API.
-- **Security trade-off**: `CLAUDE_CODE_OAUTH_TOKEN` must reach the `claude` subprocess (it *is* the auth), so `claude_env` passes it through — unlike the stripped secrets. With `ALLOWED_TOOLS` permitting full `Bash`, a prompt-injection could read it from env; narrowing the allowlist back to `Bash(git:*)` shrinks that surface.
+- **`claude setup-token`는 브라우저 OAuth 플로우라 서버(196-server)에서 직접 발급할 수 없다.** 사람이 로그인 가능한 macOS에서 실행해 나온 장기 토큰(구독 기반, ~1년 유효)을 Jenkins credential(`gitlab-auto-review-env`)에 붙여넣어 옮긴다 — 거기서 `.env` → compose `env_file` → `review_runner`의 `claude_env` → `claude` 서브프로세스로 흘러간다.
+- **호스트 마운트는 없다.** 리뷰에 필요한 config(`commands/`, `agents/`, `settings.json`, env-dump 차단 훅)는 `claude-config/`로 이 레포에 vendoring되어 있고, `Dockerfile`이 `COPY claude-config/ /opt/reviewer-claude/` + `ENV CLAUDE_CONFIG_DIR=/opt/reviewer-claude`로 이미지에 굽는다. `docker-compose.yml`에는 `volumes:`도 `CLAUDE_CONFIG_DIR` 재정의도 없다 — `tests/test_deploy_config.py`가 이 두 가지를 회귀 테스트로 고정한다.
+- 토큰이 만료되거나 비어 있으면 `claude -p`가 `Not logged in`으로 실패한다 — 여전히 1순위 용의자. macOS에서 `claude setup-token`을 재실행하고 Jenkins credential을 갱신한다. (`/login`의 단기 OAuth 토큰은 ~8시간이면 죽고 갱신도 없다 — `setup-token`의 장기 토큰을 쓸 것.)
+- `ANTHROPIC_API_KEY`는 의도적으로 비운다 — 인증은 구독 OAuth 토큰이지 API가 아니다.
+- **보안 트레이드오프**: `CLAUDE_CODE_OAUTH_TOKEN`은 `claude` 서브프로세스에 반드시 도달해야 하므로(그게 인증 수단이라) `claude_env`가 이를 통과시킨다 — 다른 시크릿(`GITLAB_TOKEN` 등)과 달리 strip 대상이 아니다. `ALLOWED_TOOLS`가 전체 `Bash`를 허용하면 prompt-injection이 env에서 이를 읽어갈 수 있으므로, `Bash(git:*)`로 좁힌 allowlist가 이 표면을 줄인다.
 
 ### Claude invocation rules
 
 In `run_claude_review()`, the **first line of the prompt must be the slash command** (`/review-pr\n`) — Claude Code only treats it as a slash command in that position. Output is requested in Korean markdown. The CLI's output is posted to the MR **verbatim** — `post_comment()` prepends no header (the `/review-pr` output already carries its own heading). The only thing it adds is the trailing `<!-- ai-auto-review reviewed-sha: … -->` marker (see Incremental review). Failures instead post the `⚠️` header — see Failure notification.
 
+모델은 `CLAUDE_MODEL = "opus"`로 **핀한다** — `--model`을 넘기지 않으면 계정 기본 모델을 따라가고, 재배포나 계정 정책 변경 한 번에 리뷰 톤·구조가 조용히 바뀐다(2026-09-02 재배포 후 실제 발생: 코드·태그는 7월 31일 그대로인데 스타일만 변함). Dockerfile의 CLI 버전 핀(`@2.1.220`)은 CLI 코드만 고정할 뿐 모델도 서버측 기능 플래그(`.claude.json`의 `cachedGrowthBookFeatures`, 컨테이너 재생성마다 새로 받음)도 잡지 못한다. `tests/test_deploy_config.py::test_claude_invocation_pins_model`이 상수와 argv 전달을 함께 고정한다.
+
+출력 형식(심각도 표 + `경로:줄번호` 앵커 + "확인했고 문제 없던 것" + 결론)은 **프롬프트가 지시**한다 — `/review-pr` 커맨드 정의에는 이 템플릿이 없다. 형식을 바꾸려면 `run_claude_review()`의 프롬프트를 고친다.
+
 Tool access is gated by a **static** `--allowed-tools` allowlist (`Read,Glob,Grep,Bash(git:*),Task`), deliberately **not** `--permission-mode auto`: auto mode consults a classifier model on every Bash call, and when that model is "temporarily unavailable" the unattended `-p` run has no one to fall back to — it stalls for the entire `CLAUDE_TIMEOUT_SEC` and is killed. The static allowlist has no model dependency. Don't switch this back to `auto`. `Task` is required — `/review-pr` spawns specialized subagents (code-reviewer, silent-failure-hunter, …) via Task; without it the review collapses to a single pass.
 
-`Bash(git:*)` does **not** by itself prevent arbitrary command execution — `git -c core.pager=…`, `git -c diff.external=…`, and `!`-aliases all run a shell and all match the `git ` prefix. So the allowlist is a surface-reducer, not an RCE seal. **Subagent caveat**: the parent `--allowed-tools` does **not** propagate to Task-spawned subagents — each runs under its own definition. So `/review-pr`'s subagents are *separately* narrowed in the host `~/.claude/agents/` — all six (code-reviewer, comment-analyzer, pr-test-analyzer, silent-failure-hunter, type-design-analyzer, code-simplifier) end up at `tools: [Read, Grep, Glob, Bash(git:*)]`, with code-simplifier additionally losing Write/Edit. **A new deployment must reapply this narrowing on its host** (it lives outside this repo). The deeper defense is **env isolation**: `claude_env` strips `GITLAB_TOKEN`, `WEBHOOK_SECRET`, `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`. But `CLAUDE_CODE_OAUTH_TOKEN` can **not** be stripped (claude needs it to authenticate), so the `Bash(git:*)` scoping on **both** parent and subagents is what guards that token from injection-driven exfiltration. `claude` only runs local git (`diff`/`log`/`show`) on the already-cloned repo, so the narrowing costs nothing. Never pass the full process environment to `claude`.
+`Bash(git:*)` does **not** by itself prevent arbitrary command execution — `git -c core.pager=…`, `git -c diff.external=…`, and `!`-aliases all run a shell and all match the `git ` prefix. So the allowlist is a surface-reducer, not an RCE seal. **Subagent caveat**: the parent `--allowed-tools` does **not** propagate to Task-spawned subagents — each runs under its own definition. So `/review-pr`'s subagents are *separately* narrowed in `claude-config/agents/` — all six (code-reviewer, comment-analyzer, pr-test-analyzer, silent-failure-hunter, type-design-analyzer, code-simplifier) end up at `tools: [Read, Grep, Glob, Bash(git:*)]`, with code-simplifier additionally losing Write/Edit. 서브에이전트 6개는 `claude-config/agents/`에 vendoring되어 이미지에 구워지고, `tests/test_deploy_config.py`가 `Read`/`Grep`/`Glob`/`Bash(git:*)` 외의 도구를 거부한다. 호스트 설정에 의존하지 않으므로 새 배포에서 다시 좁힐 필요가 없다. The deeper defense is **env isolation**: `claude_env` strips `GITLAB_TOKEN`, `WEBHOOK_SECRET`, `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`. But `CLAUDE_CODE_OAUTH_TOKEN` can **not** be stripped (claude needs it to authenticate), so the `Bash(git:*)` scoping on **both** parent and subagents is what guards that token from injection-driven exfiltration. `claude` only runs local git (`diff`/`log`/`show`) on the already-cloned repo, so the narrowing costs nothing. Never pass the full process environment to `claude`.
 
 ### Failure notification
 
@@ -173,7 +178,7 @@ Consumed at import time (`os.environ[...]` — missing keys crash on boot, by de
 공통 (`review_runner.py`):
 - `GITLAB_URL` — base URL, no trailing slash (stripped defensively anyway).
 - `GITLAB_TOKEN` — PAT with `api` scope.
-- `CLAUDE_CODE_OAUTH_TOKEN` — `claude setup-token`(호스트 실행)으로 발급한 구독 OAuth 토큰. `claude` 인증에 쓰인다 — 컨테이너는 macOS Keychain을 못 읽으므로 **필수**(없으면 `claude -p`가 `Not logged in`). import가 아니라 claude 실행 시점에 필요. Auth model 섹션 참고.
+- `CLAUDE_CODE_OAUTH_TOKEN` — `claude setup-token`(macOS에서 브라우저 OAuth로 발급, 서버에서는 발급 불가)으로 얻은 구독 OAuth 토큰. `claude` 인증에 쓰인다 — 이미지에 구워지지 않는 유일한 인증 조각이라 **필수**(없으면 `claude -p`가 `Not logged in`). import가 아니라 claude 실행 시점에 필요. Auth model 섹션 참고.
 - `REVIEWER_USERNAME` (default `max`) — `webhook_server.py`에선 `reviewers[].username` 필터, `review_runner.py`에선 실패 알림 코멘트의 `@`-mention 대상, `slack_bot.py` 폴러에선 폴링 대상 MR의 `reviewer_username` 필터.
 
 webhook 모드 (`webhook_server.py`):

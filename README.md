@@ -2,7 +2,7 @@
 
 GitLab 사내 인스턴스에서 본인이 리뷰어로 지정된 MR에 대해 Claude Code CLI(`/review-pr`)로 자동 코드 리뷰 코멘트를 남기는 서비스.
 
-- Anthropic API 미사용 — 호스트의 Claude 구독 세션을 컨테이너에 마운트해서 사용
+- Anthropic API 미사용 — 구독 기반 OAuth 토큰(`CLAUDE_CODE_OAUTH_TOKEN`)으로 `claude` 인증, 리뷰 config(`claude-config/`)는 이미지에 구워짐(호스트 마운트 없음)
 - 실행 환경: Docker (FastAPI + Claude Code CLI)
 - 리뷰 트리거: GitLab webhook의 `Merge request events` 중 `action ∈ {open, update}` & `reviewers`에 지정 username 포함
 - `claude` 호출은 `--allowed-tools` 정적 화이트리스트(`Read,Glob,Grep,Bash(git:*)`)로 표면을 줄이고, `GITLAB_TOKEN`·`WEBHOOK_SECRET`을 claude 서브프로세스 env에서 제거 — diff prompt injection이 성공해도 토큰이 env에 없어 유출 불가
@@ -11,14 +11,15 @@ GitLab 사내 인스턴스에서 본인이 리뷰어로 지정된 MR에 대해 C
 
 ## 사전 준비
 
-1. 호스트에 Claude Code CLI 설치 & 로그인
+1. macOS에서 Claude Code CLI 설치 & OAuth 토큰 발급 (`claude setup-token`은 브라우저 OAuth라 서버에서는 발급 불가)
    ```bash
    npm install -g @anthropic-ai/claude-code
-   claude login
-   ls ~/.claude/   # credentials 디렉토리 확인
+   claude setup-token   # 브라우저 로그인 후 장기 토큰 출력 (구독 기반, ~1년 유효)
    ```
+   출력된 토큰을 Jenkins credential(`gitlab-auto-review-env`, Secret file)의
+   `CLAUDE_CODE_OAUTH_TOKEN=...` 줄에 넣는다. 배경은 `CLAUDE.md`의 Auth model 절 참고.
 2. GitLab Personal Access Token 발급 (`api` 스코프) — GitLab → Preferences → Access Tokens
-3. Webhook 시크릿용 임의의 긴 랜덤 문자열 준비
+3. Webhook 시크릿용 임의의 긴 랜덤 문자열 준비 (webhook 모드 전용 — 기본 CMD인 Slack 봇 모드라면 생략 가능)
 
 ## 셋업
 
@@ -34,7 +35,7 @@ cp .env.example .env
 |---|---|---|
 | `GITLAB_URL` | `https://gitlab.사내.도메인` | 끝 슬래시 X. `http(s)://`만 허용. embedded auth(`user:pass@`) 거부 |
 | `GITLAB_TOKEN` | `glpat-...` | `api` 스코프 PAT |
-| `WEBHOOK_SECRET` | 랜덤 16자 이상 | `change-me*`로 시작하면 부팅 거부 |
+| `WEBHOOK_SECRET` | 랜덤 16자 이상 | webhook 모드(`webhook_server.py`) 전용 — 기본 CMD인 Slack 봇 모드(`slack_bot.py`)는 이 변수를 읽지 않는다. webhook 모드에서 `change-me*`로 시작하면 부팅 거부 |
 | `REVIEWER_USERNAME` | `max` | 리뷰 트리거 대상 GitLab username + 리뷰 실패 시 알림 코멘트의 `@`멘션 대상 (생략 시 `max`) |
 
 `WEBHOOK_SECRET` 생성 한 줄:
@@ -47,16 +48,30 @@ openssl rand -base64 32
 
 ### 2. 빌드 & 실행
 
+**배포 (196-server)** — 태그를 푸시하면 Jenkins가 3분 내 폴링해서 배포한다:
+
+```bash
+git tag v1.x.y && git push gitlab v1.x.y
+```
+
+로그 확인:
+
+```bash
+ssh 196-server 'docker logs -f gitlab-ai-reviewer'
+```
+
+(`container_name`이 고정이라 cwd 무관하게 동작한다. `docker compose down`/재시작처럼
+compose 자체가 필요하면 Jenkins job의 워크스페이스 디렉토리로 먼저 `cd`해야 한다 —
+`ssh host 'cmd'`는 `$HOME`에서 시작한다.)
+
+**로컬 실행** (호스트 마운트 없음 — `claude-config/`가 이미지에 구워져 있어 어느 환경에서든 동일하게 뜬다):
+
 ```bash
 docker compose up -d --build
 docker compose logs -f ai-reviewer
 ```
 
-부팅 시 `WEBHOOK_SECRET` 길이/패턴, `GITLAB_URL` 스킴, 필수 env 누락 여부를 검증한다. 검증 실패 시 컨테이너가 즉시 종료되므로 로그에서 사유 확인.
-
-`~/.claude` 마운트는 rw로 둔다 — `claude`의 Bash 도구가 `~/.claude/shell-snapshots/`에 쓰고 OAuth 토큰 갱신도 쓰기가 필요해, `:ro`면 `EROFS`로 Bash 도구가 깨진다. `claude` 호출은 `--allowed-tools` 화이트리스트(읽기 도구 + git 하위명령)로 제한되어 git 외 임의 명령 실행은 차단된다.
-
-> **`sudo docker compose`로 실행하는 환경 주의**: base `docker-compose.yml`은 마운트 소스를 `~/.claude` 로 두는데, `sudo` 환경에서는 `~`이 `/root/.claude`로 확장되어 마운트가 빈 채로 컨테이너가 뜬다(→ `Not logged in` 에러). 이 경우 `docker-compose.override.yml.example`을 `docker-compose.override.yml`로 복사해 절대경로(예: `/home/max/.claude`)로 덮어쓴다. override는 `.gitignore`에 포함되어 커밋되지 않는다.
+부팅 시 `GITLAB_URL` 스킴, 필수 env 누락 여부를 검증한다(두 모드 공통). `WEBHOOK_SECRET` 길이/패턴 검증은 webhook 모드(`webhook_server.py`)에서만 수행된다 — 기본 CMD인 Slack 봇 모드는 이 변수를 아예 읽지 않으므로 배포 credential에 넣을 필요가 없다. 검증 실패 시 컨테이너가 즉시 종료되므로 로그에서 사유 확인.
 
 ## GitLab Webhook 등록
 
@@ -127,13 +142,11 @@ MR에 커밋이 push될 때마다 webhook `update`가 발동해 리뷰가 다시
 
 | 증상 | 원인 | 해결 |
 |---|---|---|
-| 부팅 직후 즉시 종료 | `WEBHOOK_SECRET` 16자 미만 또는 `change-me*` 시작 | 랜덤 시크릿 재생성 후 `.env` 갱신 |
+| 부팅 직후 즉시 종료 (webhook 모드 한정) | `WEBHOOK_SECRET` 16자 미만 또는 `change-me*` 시작 | 랜덤 시크릿 재생성 후 `.env` 갱신 |
 | 부팅 직후 즉시 종료 + `GITLAB_URL` 에러 | http/https 아닌 스킴, 또는 `user:pass@` 포함 | URL을 `https://gitlab.예제.com` 형태로 정리 |
-| 리뷰 코멘트에 `Bash 도구 동작 안 함 (EROFS)` | `~/.claude`가 `:ro`로 마운트돼 claude Bash 도구가 shell-snapshot을 못 씀 | docker-compose에서 `:ro` 제거 (기본값이 rw) 후 컨테이너 재생성 |
-| `~/.claude` 권한 에러 / OAuth 갱신 실패 | read-only 마운트 | docker-compose에서 `:ro` 제거 |
 | 401 응답만 반복 | 헤더/시크릿 불일치 | GitLab Webhook 설정의 Secret Token과 `.env`의 `WEBHOOK_SECRET` 일치 확인 |
 | `review in progress` 응답 반복 | 같은 MR로 webhook 빨리 두 번 옴 (의도된 차단) | 첫 리뷰 끝나면 in-flight set이 자동 해제됨 |
-| `Claude 응답이 비어있음` 로그 | 호스트 세션 만료 | 호스트에서 `claude login` 재실행 (컨테이너 재시작 불필요) |
+| `Claude 응답이 비어있음` 로그 | `CLAUDE_CODE_OAUTH_TOKEN` 만료/무효 | macOS에서 `claude setup-token` 재실행 → Jenkins credential(`gitlab-auto-review-env`) 갱신 → 재배포 |
 | `claude CLI를 PATH에서 찾을 수 없음` | 이미지 빌드 실패 | `docker compose build` 재실행, `docker compose exec ai-reviewer claude --version` 확인 |
 | webhook 이벤트는 오는데 skipped | `action`/`reviewers` 불일치 또는 payload 형식 이상 | `docker compose logs`에서 skip 사유 로그 확인 |
 | `review_runner timeout` 로그 | 리뷰가 외곽 가드(`SUBPROCESS_TIMEOUT_SEC`=2400s) 초과 — claude 자체 한도는 `CLAUDE_TIMEOUT_SEC`=1200s | 서버 부하/네트워크 확인. 반복되면 두 값 조정 (외곽이 내부 worst-case보다 커야 실패 알림 코멘트가 게시됨) |
@@ -141,7 +154,6 @@ MR에 커밋이 push될 때마다 webhook `update`가 발동해 리뷰가 다시
 ## 향후 개선 (스코프 외)
 
 - 인라인 코멘트 게시 (현재 discussions API는 증분 리뷰용 읽기 전용으로만 사용)
-- `~/.claude` 마운트 분리 — 호스트 사용자 자격증명 격리 (별도 서비스 계정 Claude 세션)
 - SIGTERM graceful shutdown — 진행 중 자식 프로세스 정리
 - 파일 확장자 필터링
 - Approve / Request Changes 자동 처리
