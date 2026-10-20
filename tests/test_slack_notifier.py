@@ -78,3 +78,25 @@ def test_classify_other_docs_is_code():
 def test_classify_empty_is_none():
     # 변경 파일 0개(조회 실패·빈 MR) — 판별 불가.
     assert slack_notifier.classify_review_type([]) is None
+
+
+def test_classify_adr_at_repo_root_decisions_is_intent():
+    assert slack_notifier.classify_review_type(["decisions/ADR-001-x.md"]) == "intent"
+
+
+def test_classify_adr_named_code_file_is_code():
+    # ADR- 접두라도 .md가 아니면 문서가 아니다.
+    assert slack_notifier.classify_review_type(["src/decisions/ADR-x.py"]) == "code"
+
+
+def test_classify_non_adr_in_decisions_is_code():
+    assert slack_notifier.classify_review_type(["x/decisions/README.md"]) == "code"
+
+
+def test_classify_intents_prefix_lookalike_is_code():
+    assert slack_notifier.classify_review_type(["docs/intents-old/x.md"]) == "code"
+
+
+def test_classify_empty_path_entry_is_code():
+    # 경로가 비어 온 항목(조회 응답 이상)은 intent로 단정하지 않는다.
+    assert slack_notifier.classify_review_type(["docs/intents/a.md", ""]) == "code"

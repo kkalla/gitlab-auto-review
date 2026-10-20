@@ -34,8 +34,9 @@ _MR_URL_RE = re.compile(
 
 
 # intent 리뷰(사람 검토) 대상 문서 경로. agentic-ocr-impl docs/agents/workflow.md §2·§3 —
-# intent(docs/intents/)와 ADR(…/decisions/ADR-*)만 바뀐 MR은 Draft 단계의 문서 검토다.
-_INTENT_PATH_RE = re.compile(r"^docs/intents/|/decisions/ADR-[^/]+$")
+# intent(docs/intents/*.md)와 ADR(…/decisions/ADR-*.md)만 바뀐 MR은 Draft 단계의 문서 검토다.
+# .md로 한정 — ADR- 접두 코드 파일 등이 문서로 오판되지 않게.
+_INTENT_PATH_RE = re.compile(r"^docs/intents/.+\.md$|(^|/)decisions/ADR-[^/]+\.md$")
 
 
 def classify_review_type(paths: list[str]) -> str | None:

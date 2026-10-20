@@ -10,7 +10,7 @@ WebSocket을 직접 연다(방화벽/NAT 무관).
                              리뷰어에게 DM(MR 링크 + intent/코드 리뷰 안내 + 「코드 리뷰하기」
                              버튼)을 보낸다. 리뷰는 버튼을 눌러야 돈다(자동 실행 안 함)
 
-Notion 조회 슬래시 커맨드(/task-status·/project-status)는 96_ags-watchtower로
+Notion 조회 슬래시 커맨드(/task-status·/project-status)는 98_ags-watchtower로
 분리됐다 — 이 봇은 MR 리뷰 전용이다.
 
 공통 흐름:
@@ -135,7 +135,7 @@ def _parse_mention(text: str) -> tuple[int, int, str] | None:
 
 
 def _post(channel: str | None, thread_ts: str | None, text: str) -> None:
-    """스레드 답글 게시 (best-effort). channel이 없으면(폴링 트리거 등) no-op."""
+    """스레드 답글 게시 (best-effort). channel이 없으면 no-op."""
     if not channel:
         return
     try:
@@ -157,8 +157,8 @@ def _run_review_and_report(
     진행 상황이 실시간 노출된다. SLACK_* / GITLAB_* env도 그대로 상속되므로
     review_runner가 MR 코멘트 + 리뷰어/assignee DM을 직접 보낸다.
 
-    channel이 None이면(폴링 트리거) 스레드 답글은 _post가 알아서 생략한다 —
-    결과 통지는 review_runner의 MR 코멘트 + DM으로 충분하다.
+    rc=0은 "리뷰 게시"만이 아니다 — 닫힌 MR·fork MR·새 커밋 0개도 코멘트 없이 0으로
+    끝나므로 성공 답글은 게시 여부를 단정하지 않는다.
     """
     key = (project_id, mr_iid)
     rc: int | None = None
@@ -183,7 +183,8 @@ def _run_review_and_report(
         _post(
             channel,
             thread_ts,
-            f"⚠️ 리뷰가 시간 초과로 종료됐어요 (MR !{mr_iid}). 컨테이너 로그를 확인해 주세요.",
+            f"⚠️ 리뷰가 시간 초과로 종료됐어요 (MR !{mr_iid}). 컨테이너 로그를 확인해 주세요. "
+            "다시 돌리려면 봇을 MR URL과 함께 @멘션해 주세요.",
         )
         return
     except Exception:
@@ -200,7 +201,8 @@ def _run_review_and_report(
         _post(
             channel,
             thread_ts,
-            f"✅ 리뷰 완료 — <{web_url}|MR !{mr_iid}>에 코멘트를 남겼어요. DM도 확인해 주세요.",
+            f"✅ 리뷰 처리가 끝났어요 — <{web_url}|MR !{mr_iid}>의 코멘트를 확인해 주세요. "
+            "(닫힌 MR이거나 새 커밋이 없으면 코멘트 없이 끝나요)",
         )
     else:
         # review_runner가 실패해도 자체적으로 MR에 ⚠️ 코멘트 + 리뷰어 DM을 남긴다.
@@ -208,7 +210,8 @@ def _run_review_and_report(
             channel,
             thread_ts,
             f"⚠️ 리뷰가 실패로 끝났어요 (MR !{mr_iid}, rc={rc}). "
-            f"<{web_url}|MR>의 실패 알림 코멘트와 로그를 확인해 주세요.",
+            f"<{web_url}|MR>의 실패 알림 코멘트와 로그를 확인해 주세요. "
+            "다시 돌리려면 봇을 MR URL과 함께 @멘션해 주세요.",
         )
 
 
@@ -259,7 +262,7 @@ def handle_mention(event: dict, say) -> None:
             thread_ts=thread_ts,
             text=(
                 "리뷰할 MR을 못 찾았어요. GitLab Merge Request URL을 함께 멘션해 주세요.\n"
-                "예: `@ags-watchtower https://git.example.com/group/repo/-/merge_requests/123`"
+                "예: `@<이 봇> https://git.example.com/group/repo/-/merge_requests/123`"
             ),
         )
         return
@@ -277,7 +280,7 @@ def handle_review_button(ack, body: dict, client) -> None:
     """리뷰 요청 DM의 「코드 리뷰하기」 버튼. 기존 자동 리뷰를 돌려 MR에 코멘트를 남긴다."""
     ack()
     # DM은 REVIEWER_SLACK_ID에게만 가지만, 버튼 payload는 누른 사람 기준으로 다시 확인한다.
-    if (body.get("user") or {}).get("id") != REVIEWER_SLACK_ID:
+    if not REVIEWER_SLACK_ID or (body.get("user") or {}).get("id") != REVIEWER_SLACK_ID:
         logger.warning("리뷰 버튼: 허용되지 않은 사용자 클릭 무시 (%s)", body.get("user"))
         return
     try:
@@ -305,30 +308,60 @@ def handle_review_button(ack, body: dict, client) -> None:
         logger.exception("리뷰 버튼: DM 갱신 실패")
 
 
+# 페이지네이션 상한 (per_page=100 → 최대 2000건). 넘으면 일부만 본 결과로 판단하지
+# 않도록 None을 돌려 호출부가 "조회 불가"로 다루게 한다.
+_MAX_GITLAB_PAGES = 20
+
+
+def _gitlab_get_all(url: str, params: dict) -> list | None:
+    """GitLab 목록 API를 X-Next-Page를 따라 끝까지 읽는다. 상한 초과·비목록 응답이면 None.
+
+    HTTP 오류는 httpx.HTTPStatusError로 그대로 던진다(호출부가 404 폴백 등 판단).
+    """
+    items: list = []
+    page = "1"
+    for _ in range(_MAX_GITLAB_PAGES):
+        resp = httpx.get(
+            url,
+            headers={"PRIVATE-TOKEN": GITLAB_TOKEN},
+            params={**params, "per_page": 100, "page": page},
+            timeout=30.0,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if not isinstance(data, list):
+            return None
+        items += data
+        page = resp.headers.get("X-Next-Page", "")
+        if not page:
+            return items
+    logger.warning("GitLab 페이지 상한(%s) 초과 — 결과 버림: %s", _MAX_GITLAB_PAGES, url)
+    return None
+
+
 def _fetch_changed_paths(project_id: int, mr_iid: int) -> list[str]:
-    """MR 변경 파일 경로 목록. 실패 시 빈 리스트(→ 리뷰 유형 판별 불가).
+    """MR 변경 파일 경로 목록. 실패·상한 초과 시 빈 리스트(→ 리뷰 유형 판별 불가).
 
     `/diffs`(GitLab 15.7+)를 먼저, 404면 구버전용 `/changes`로 재시도한다.
     """
     base = f"{GITLAB_URL}/api/v4/projects/{project_id}/merge_requests/{mr_iid}"
-    for endpoint in ("diffs", "changes"):
+    try:
         try:
-            resp = httpx.get(
-                f"{base}/{endpoint}",
-                headers={"PRIVATE-TOKEN": GITLAB_TOKEN},
-                params={"per_page": 100},
-                timeout=30.0,
-            )
-            if resp.status_code == 404 and endpoint == "diffs":
-                continue
+            files = _gitlab_get_all(f"{base}/diffs", {})
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code != 404:
+                raise
+            resp = httpx.get(f"{base}/changes", headers={"PRIVATE-TOKEN": GITLAB_TOKEN}, timeout=30.0)
             resp.raise_for_status()
             data = resp.json()
-        except Exception:
-            logger.exception("MR 변경 파일 조회 실패 (project=%s mr=%s)", project_id, mr_iid)
-            return []
-        files = data.get("changes", []) if isinstance(data, dict) else data
-        return [f.get("new_path") or f.get("old_path") or "" for f in files if isinstance(f, dict)]
-    return []
+            # overflow=true면 GitLab이 변경 목록을 잘랐다 — 일부만 보고 판별하지 않는다.
+            files = None if not isinstance(data, dict) or data.get("overflow") else data.get("changes")
+    except Exception:
+        logger.exception("MR 변경 파일 조회 실패 (project=%s mr=%s)", project_id, mr_iid)
+        return []
+    if not isinstance(files, list):
+        return []
+    return [f.get("new_path") or f.get("old_path") or "" for f in files if isinstance(f, dict)]
 
 
 def _escape_mrkdwn(text: str) -> str:
@@ -346,8 +379,11 @@ _REVIEW_TYPE_GUIDE = {
 }
 
 
-def _notify_review_request(mr: dict, reason: str) -> None:
-    """리뷰어에게 리뷰 요청 DM — MR 링크 + intent/코드 리뷰 안내 + 「코드 리뷰하기」 버튼."""
+def _notify_review_request(mr: dict, reason: str) -> bool:
+    """리뷰어에게 리뷰 요청 DM — MR 링크 + intent/코드 리뷰 안내 + 「코드 리뷰하기」 버튼.
+
+    전송 성공 여부를 반환한다 — 폴러는 성공했을 때만 SHA를 기록해 실패분을 다음 순회에 재시도.
+    """
     project_id, mr_iid, web_url = mr["project_id"], mr["iid"], mr.get("web_url", "")
     review_type = slack_notifier.classify_review_type(_fetch_changed_paths(project_id, mr_iid))
     title = _escape_mrkdwn(str(mr.get("title", ""))[:200])
@@ -368,41 +404,69 @@ def _notify_review_request(mr: dict, reason: str) -> None:
             ],
         },
     ]
-    if not slack_notifier.send_dm(REVIEWER_SLACK_ID, text, blocks):
-        logger.warning("리뷰 요청 DM 전송 실패 (MR !%s)", mr_iid)
+    sent = slack_notifier.send_dm(REVIEWER_SLACK_ID, text, blocks)
+    if not sent:
+        logger.warning("리뷰 요청 DM 전송 실패 (MR !%s) — 다음 순회에 재시도", mr_iid)
+    return sent
 
 
-def _fetch_open_reviewer_mrs() -> list[dict]:
-    """REVIEWER_USERNAME이 리뷰어로 지정된, 열린 MR 목록. 실패 시 빈 리스트.
+def _fetch_open_reviewer_mrs() -> list[dict] | None:
+    """REVIEWER_USERNAME이 리뷰어로 지정된, 열린 MR 목록. 조회 실패 시 None.
 
-    각 항목에서 project_id, iid, sha(source branch HEAD), web_url을 쓴다.
+    실패를 빈 리스트로 돌리면 "열린 MR 0개"와 구분되지 않아, baseline이 빈 채로 잡혀
+    다음 순회에 기존 MR 전부가 신규 지정으로 오인된다(DM 폭주). 그래서 None으로 구분한다.
     scope=all로 봇 계정이 접근 가능한 모든 프로젝트를 가로질러 조회한다.
     """
     try:
-        resp = httpx.get(
+        return _gitlab_get_all(
             f"{GITLAB_URL}/api/v4/merge_requests",
-            headers={"PRIVATE-TOKEN": GITLAB_TOKEN},
-            params={
-                "reviewer_username": REVIEWER_USERNAME,
-                "state": "opened",
-                "scope": "all",
-                "per_page": 100,
-            },
-            timeout=30.0,
+            {"reviewer_username": REVIEWER_USERNAME, "state": "opened", "scope": "all"},
         )
-        resp.raise_for_status()
-        data = resp.json()
     except Exception:
         logger.exception("열린 MR 목록 폴링 조회 실패")
-        return []
-    return data if isinstance(data, list) else []
+        return None
+
+
+def _poll_once(seen: dict[tuple[int, int], str], baseline: bool) -> bool:
+    """폴링 1회. 조회에 성공하면 True(호출부가 baseline 완료로 본다), 실패면 False.
+
+    seen((project_id, iid) → 마지막으로 DM한 source SHA)을 제자리 갱신한다.
+    - baseline: 기록만 하고 DM은 안 보낸다(봇 기동 시 기존 MR 일괄 DM 방지).
+    - 신규 지정(seen에 없음)·새 push(SHA 변경)는 DM, **전송 성공 시에만** 기록 → 실패분 재시도.
+    - 목록에서 빠진 MR(리뷰어 해제·close·merge)은 지운다 → 재지정되면 다시 DM.
+    - fork MR은 review_runner가 스킵하므로 DM하지 않는다.
+    """
+    mrs = _fetch_open_reviewer_mrs()
+    if mrs is None:
+        return False  # 조회 실패 — seen을 건드리지 않는다
+    current: set[tuple[int, int]] = set()
+    for mr in mrs:
+        iid, pid, sha = mr.get("iid"), mr.get("project_id"), mr.get("sha")
+        if not isinstance(iid, int) or not isinstance(pid, int) or not sha:
+            continue
+        if mr.get("source_project_id", pid) != pid:
+            continue  # fork MR
+        key = (pid, iid)
+        current.add(key)
+        prev = seen.get(key)
+        if baseline:
+            seen[key] = sha
+            continue
+        if prev == sha:
+            continue
+        # prev is None → 새로 리뷰어로 지정된 MR / prev != sha → 기존 MR에 새 push
+        reason = f"새 push {prev[:8]}→{sha[:8]}" if prev else "리뷰어로 지정됨"
+        logger.info("폴링: MR !%s %s → 리뷰 요청 DM", iid, reason)
+        if _notify_review_request(mr, reason):
+            seen[key] = sha
+    for key in seen.keys() - current:
+        del seen[key]
+    return True
 
 
 def _poll_loop() -> None:
-    """주기적으로 리뷰어 지정 열린 MR을 폴링해 신규 지정·새 push를 리뷰어에게 DM으로 알린다.
+    """주기적으로 _poll_once를 돌린다. 첫 **성공** 순회를 baseline으로 잡는다.
 
-    첫 순회는 baseline만 잡고(봇 기동 시 기존 MR 일괄 DM 방지) 이후 **새로 리뷰어로
-    지정된 MR**(seen에 없던 것)과 **source SHA가 바뀐 MR**(새 push)마다 DM을 보낸다.
     리뷰 실행은 DM 버튼이 맡는다 — 증분/스킵 판단은 review_runner의 reviewed-sha 마커.
     push마다 리뷰 유형을 다시 판별한다 — intent 검토 뒤 같은 MR에 구현이 올라오기 때문.
 
@@ -411,26 +475,12 @@ def _poll_loop() -> None:
     """
     # iid는 프로젝트별 번호라 단독 키로 쓰면 다른 프로젝트의 같은 번호 MR끼리 SHA를 덮어써
     # 매 순회 "새 push"로 오인한다 → (project_id, iid)로 키를 잡는다.
-    seen: dict[tuple[int, int], str] = {}  # (project_id, iid) -> 마지막으로 본 source SHA
-    first = True
+    seen: dict[tuple[int, int], str] = {}
+    baselined = False
     while True:
         try:
-            for mr in _fetch_open_reviewer_mrs():
-                iid = mr.get("iid")
-                sha = mr.get("sha")
-                pid = mr.get("project_id")
-                if not isinstance(iid, int) or not isinstance(pid, int) or not sha:
-                    continue
-                prev = seen.get((pid, iid))
-                seen[(pid, iid)] = sha
-                if first or prev == sha:
-                    continue  # baseline(기동 시 기존 MR)이거나 변경 없음
-                # prev is None → 기동 후 새로 리뷰어로 지정된 MR
-                # prev != sha  → 기존 MR에 새 push(증분)
-                reason = f"새 push {prev[:8]}→{sha[:8]}" if prev else "리뷰어로 지정됨"
-                logger.info("폴링: MR !%s %s → 리뷰 요청 DM", iid, reason)
-                _notify_review_request(mr, reason)
-            first = False
+            if _poll_once(seen, baseline=not baselined):
+                baselined = True
         except Exception:
             logger.exception("폴링 루프 오류")
         time.sleep(POLL_INTERVAL_SEC)

@@ -1,6 +1,14 @@
 # Slack 봇 모드 설정 (Socket Mode)
 
 `slack_bot.py`는 Slack에서 GitLab MR 리뷰를 트리거하는 진입점이다.
+
+> ⚠️ **Slack 앱이 `ags-watchtower`와 분리돼 있다.** 이 봇은 **전용 앱(App ID
+> `A0BFM68FM41`)**을 쓴다. `ags-watchtower` 앱은 `98_ags-watchtower` 레포 봇 소유다.
+> - 그 앱의 토큰을 여기 `.env`에 넣지 않는다 — 같은 앱 토큰으로 Socket Mode 소켓을 두
+>   군데서 열면 Slack이 이벤트를 분산시켜 양쪽 다 간헐적으로 유실된다.
+> - 아래 manifest·Interactivity 변경도 **이 앱에만** 한다. `ags-watchtower` 앱에 적용하면
+>   그쪽 지식 봇이 쓰는 `channels:history` 등이 빠져 망가진다.
+> - 앱 설정: `https://app.slack.com/app-settings/T0A6YUSHNRG/A0BFM68FM41/general`
 **Socket Mode**라 공개 inbound URL·포트·리버스 프록시가 필요 없다 — 봇이 Slack으로
 아웃바운드 WebSocket을 직접 연다(방화벽/NAT 무관).
 
@@ -10,31 +18,31 @@
   확인해, **새로 리뷰어로 지정**되거나 **새 push**가 들어온 MR마다 리뷰어에게 DM을 보낸다(§6).
   DM에는 MR 링크, **Intent 리뷰 / 코드 리뷰** 안내, 「코드 리뷰하기」 버튼이 있다. 리뷰는
   버튼을 눌러야 돈다(자동 실행 안 함).
-- **수동·멘션** — `@ags-watchtower <MR URL>`로 직접 멘션하면 바로 리뷰.
+- **수동·멘션** — `@<봇> <MR URL>`로 직접 멘션하면 바로 리뷰.
 
 ```
 (DM)   POLL_INTERVAL_SEC마다 열린 MR의 source SHA 확인 → 신규 지정·새 push
          → 변경 파일로 intent/코드 판별 → 리뷰어 DM(링크 + 안내 + 버튼)
          → 「코드 리뷰하기」 클릭 → 리뷰 시작
-(멘션) @ags-watchtower <MR URL> → 봇 app_mention 수신 → 리뷰 시작
+(멘션) @<봇> <MR URL> → 봇 app_mention 수신 → 리뷰 시작
   → project_id/mr_iid 해석
   → review_runner.py 서브프로세스 (증분은 MR 코멘트 reviewed-sha 마커로 자동)
   → 완료/실패 시 스레드 답글(멘션은 채널 스레드, 버튼은 DM 스레드) + 리뷰어·assignee DM
 ```
 
-## 1. Slack App 생성 (manifest)
+## 1. Slack App 생성 (manifest) — 새로 만들 때만
 
 <https://api.slack.com/apps> → **Create New App** → **From an app manifest** →
 워크스페이스 선택 → 아래 YAML 붙여넣기:
 
 ```yaml
 display_information:
-  name: AGS Watchtower
+  name: MR Reviewer          # 새로 만들 때 이름은 자유 (ags-watchtower와 겹치지 않게)
   description: GitLab MR 자동 코드 리뷰
   background_color: "#1b2a4a"
 features:
   bot_user:
-    display_name: AGS Watchtower
+    display_name: MR Reviewer
     always_online: true
 oauth_config:
   scopes:
@@ -64,14 +72,17 @@ settings:
 
 > Socket Mode를 manifest로 못 켰다면 Settings → **Socket Mode** → *Enable* 토글.
 
-> **이미 앱을 만들어 둔 경우(스코프/이벤트/interactivity를 바꿨을 때)**: Settings → **App
-> Manifest**에 위 YAML을 다시 붙여 저장한 뒤, **Install App → Reinstall to
-> Workspace**로 재설치해야 변경(버튼용 `interactivity`, 채널 트리거용 `channels:history`·
-> `message.channels` 제거)이 적용된다. 재설치해도 `SLACK_BOT_TOKEN` 값은 그대로다.
+> **이미 쓰는 앱(`A0BFM68FM41`)을 갱신할 때**: manifest를 통째로 붙이지 않는다 — 위 YAML의
+> `name`이 현재 앱 이름을 덮어쓴다. 대신 그 앱 설정에서 바뀐 것만 고친다.
+> 1. **Interactivity & Shortcuts** → 토글 **On** (리뷰 요청 DM 버튼. Socket Mode라 Request
+>    URL 불필요 — 필수 입력이면 placeholder URL 아무거나).
+> 2. (정리) **Event Subscriptions**에서 `message.channels`, **OAuth & Permissions**에서
+>    `channels:history` 제거 — 채널 알림 트리거가 없어져 안 쓴다.
+> 3. **Install App → Reinstall to Workspace**. 재설치해도 `SLACK_BOT_TOKEN` 값은 그대로다.
 
 ## 3. 봇을 채널에 초대 + 내 member ID 확인
 
-- 멘션으로 리뷰를 트리거할 채널에서 `/invite @ags-watchtower`.
+- 멘션으로 리뷰를 트리거할 채널에서 `/invite @<봇>`.
 - 리뷰 요청·완료/실패 DM을 받을 "나"의 member ID: Slack 프로필 → **⋯ 더보기** →
   **멤버 ID 복사** (`U…`) → `REVIEWER_SLACK_ID`에. **비면 리뷰 요청 DM 폴러가 뜨지 않는다**(버튼도 이 ID만 누를 수 있다).
 
@@ -121,7 +132,7 @@ podman compose logs -f ai-reviewer    # "Socket Mode 연결 시도" + "MR 폴러
 채널/스레드에서:
 
 ```
-@ags-watchtower https://git.sparklingsoda.ai:8443/vision/gitlab-auto-review/-/merge_requests/123
+@<봇> https://git.sparklingsoda.ai:8443/vision/gitlab-auto-review/-/merge_requests/123
 ```
 
 봇이 스레드에 ack → 리뷰 완료 시 MR 코멘트 + 스레드 답글 + 리뷰어·assignee DM.
@@ -144,7 +155,7 @@ podman compose logs -f ai-reviewer    # "Socket Mode 연결 시도" + "MR 폴러
   간격(기본 5분) 지연되고, 봇 재시작 직후의 지정·push는 baseline에 흡수돼 한 번 놓칠 수 있다
   (그땐 수동 `@멘션`).
 
-> Notion 현황 조회(`/task-status`·`/project-status`)는 96_ags-watchtower 레포로
+> Notion 현황 조회(`/task-status`·`/project-status`)는 98_ags-watchtower 레포로
 > 분리됐다 — 이 봇/앱엔 없다.
 
 ## assignee DM이 안 오는 경우
