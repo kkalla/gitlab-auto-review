@@ -146,6 +146,17 @@ def test_claude_invocation_pins_model():
     )
 
 
+def test_claude_invocation_pins_effort():
+    """모델과 짝인 effort 핀. 미지정이면 CLI·계정 기본 effort를 따라가 리뷰 깊이가 조용히 바뀐다."""
+    source = (ROOT / "review_runner.py").read_text(encoding="utf-8")
+    assert re.search(r'^CLAUDE_EFFORT = "(low|medium|high|xhigh|max)"', source, re.M), (
+        "CLAUDE_EFFORT 상수가 없거나 CLI가 받지 않는 값이다"
+    )
+    assert '"--effort",\n                CLAUDE_EFFORT,' in source, (
+        "claude argv에 --effort가 없다 — 상수만 있고 CLI에 전달되지 않는다"
+    )
+
+
 def test_dockerfile_bakes_claude_config():
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
     assert re.search(

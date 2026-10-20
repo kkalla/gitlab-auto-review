@@ -141,7 +141,7 @@ The container authenticates `claude` with a **long-lived OAuth token** (`CLAUDE_
 
 In `run_claude_review()`, the **first line of the prompt must be the slash command** (`/review-pr\n`) — Claude Code only treats it as a slash command in that position. Output is requested in Korean markdown. The CLI's output is posted to the MR **verbatim** — `post_comment()` prepends no header (the `/review-pr` output already carries its own heading). The only thing it adds is the trailing `<!-- ai-auto-review reviewed-sha: … -->` marker (see Incremental review). Failures instead post the `⚠️` header — see Failure notification.
 
-모델은 `CLAUDE_MODEL = "opus"`로 **핀한다** — `--model`을 넘기지 않으면 계정 기본 모델을 따라가고, 재배포나 계정 정책 변경 한 번에 리뷰 톤·구조가 조용히 바뀐다(2026-09-02 재배포 후 실제 발생: 코드·태그는 7월 31일 그대로인데 스타일만 변함). Dockerfile의 CLI 버전 핀(`@2.1.220`)은 CLI 코드만 고정할 뿐 모델도 서버측 기능 플래그(`.claude.json`의 `cachedGrowthBookFeatures`, 컨테이너 재생성마다 새로 받음)도 잡지 못한다. `tests/test_deploy_config.py::test_claude_invocation_pins_model`이 상수와 argv 전달을 함께 고정한다.
+모델은 `CLAUDE_MODEL = "claude-sonnet-5-5"`(전체 ID — 별칭은 CLI 버전마다 가리키는 모델이 다름), effort는 `CLAUDE_EFFORT = "high"`로 **핀한다**(2026-10-20 opus → Sonnet 5.5 high 전환) — `--model`을 넘기지 않으면 계정 기본 모델을 따라가고, 재배포나 계정 정책 변경 한 번에 리뷰 톤·구조가 조용히 바뀐다(2026-09-02 재배포 후 실제 발생: 코드·태그는 7월 31일 그대로인데 스타일만 변함). Dockerfile의 CLI 버전 핀(`@2.1.220`)은 CLI 코드만 고정할 뿐 모델도 서버측 기능 플래그(`.claude.json`의 `cachedGrowthBookFeatures`, 컨테이너 재생성마다 새로 받음)도 잡지 못한다. `tests/test_deploy_config.py::test_claude_invocation_pins_model`·`test_claude_invocation_pins_effort`가 상수와 argv 전달을 함께 고정한다.
 
 출력 형식(심각도 표 + `경로:줄번호` 앵커 + "확인했고 문제 없던 것" + 결론)은 **프롬프트가 지시**한다 — `/review-pr` 커맨드 정의에는 이 템플릿이 없다. 형식을 바꾸려면 `run_claude_review()`의 프롬프트를 고친다.
 

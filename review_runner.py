@@ -110,8 +110,11 @@ ALLOWED_TOOLS = "Read,Glob,Grep,Bash(git:*),Task"
 # 모델 핀 필수 — 미지정이면 계정 기본 모델을 따라가고, 재배포나 계정 정책 변경
 # 한 번에 리뷰 톤·구조가 조용히 바뀐다(2026-09-02 재배포 후 실제 발생). Dockerfile이
 # CLI 버전(@2.1.220)을 핀하는 것과 같은 이유이며, 그 핀만으로는 모델이 안 잡힌다.
-# 별칭이라 "최신 opus"를 따라간다 — 특정 스냅샷 고정이 필요하면 전체 모델 ID를 쓴다.
-CLAUDE_MODEL = "opus"
+# 별칭("sonnet")은 CLI 버전마다 가리키는 모델이 달라 전체 모델 ID로 고정한다.
+# effort도 같은 이유로 핀한다 — 미지정이면 CLI·계정 기본값을 따라 리뷰 깊이가 바뀐다.
+# (2026-10-20 opus → Sonnet 5.5 high로 전환, CLI 2.1.220의 --effort 지원 확인)
+CLAUDE_MODEL = "claude-sonnet-5-5"
+CLAUDE_EFFORT = "high"
 
 # claude 서브프로세스에서 가릴 비밀 env. 명시 키 + 비밀스러운 접미사를 차단하는
 # fail-secure denylist — .env에 새 *_TOKEN/_SECRET/_KEY가 추가돼도 수동 갱신 없이
@@ -1022,9 +1025,10 @@ def run_claude_review(
     # stdout/stderr 모두 PIPE로 캡처 — stderr는 실패 알림 코멘트의 재료가 되고,
     # 캡처 후 logger로 재출력해 docker logs 가시성도 유지한다.
     logger.info(
-        "claude 호출 시작 (timeout=%ds, model=%s, allowed-tools=%s)",
+        "claude 호출 시작 (timeout=%ds, model=%s, effort=%s, allowed-tools=%s)",
         CLAUDE_TIMEOUT_SEC,
         CLAUDE_MODEL,
+        CLAUDE_EFFORT,
         ALLOWED_TOOLS,
     )
     try:
@@ -1034,6 +1038,8 @@ def run_claude_review(
                 "-p",
                 "--model",
                 CLAUDE_MODEL,
+                "--effort",
+                CLAUDE_EFFORT,
                 "--allowed-tools",
                 ALLOWED_TOOLS,
                 "--add-dir",
